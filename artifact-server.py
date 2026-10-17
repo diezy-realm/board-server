@@ -18,6 +18,7 @@ backup before mutate.
 """
 import html as _html
 import json
+import os
 import re
 import secrets
 import shutil
@@ -28,7 +29,7 @@ from pathlib import Path
 from urllib.parse import unquote, quote, parse_qs
 
 HOST = "127.0.0.1"
-PORT = 8787
+PORT = int(os.environ.get("ARTIFACT_PORT", "8787"))
 HOME = Path.home()
 CREW = HOME / ".kiro" / "crew"
 ART_DIR = CREW / "artifacts"
@@ -611,57 +612,79 @@ def load_board():
                 meta = {}
         else:
             meta = _board_fm(text)
-        # locate sprint (sprints/sprint-NN/...) vs product-backlog
+        # locate sprint (sprints/sprint-NN/...) vs product-backlog vs archive
         parts = f.relative_to(BOARD_DIR).parts
-        sprint = parts[1] if parts and parts[0] == "sprints" and len(parts) > 1 else "product-backlog"
+        archived = parts[0] == "archive"
+        if parts and parts[0] == "sprints" and len(parts) > 1:
+            sprint = parts[1]
+        elif archived:
+            sprint = next((p for p in parts if p.startswith("sprint-")), "archive")
+        else:
+            sprint = "product-backlog"
         status_raw = (meta.get("status") or "todo").lower()
         items.append({
             "id": meta.get("id") or f.stem, "title": meta.get("title") or f.stem,
             "stage": stage, "status": status_raw, "assignee": meta.get("assignee") or "",
-            "sprint": sprint, "rel": f.relative_to(BOARD_DIR).as_posix(),
+            "sprint": sprint, "rel": f.relative_to(BOARD_DIR).as_posix(), "archived": archived,
         })
-    # sprint goals/status
-    for sd in sorted((BOARD_DIR / "sprints").glob("sprint-*")) if (BOARD_DIR / "sprints").is_dir() else []:
+    # sprint goals/status (active sprints + archived sprints)
+    sprint_dirs = list((BOARD_DIR / "sprints").glob("sprint-*")) if (BOARD_DIR / "sprints").is_dir() else []
+    sprint_dirs += list((BOARD_DIR / "archive").glob("sprint-*")) if (BOARD_DIR / "archive").is_dir() else []
+    for sd in sorted(sprint_dirs):
         sp = sd / "SPRINT.md"
         g = {"goal": "", "category": "", "status": "active"}
         if sp.is_file():
             fm = _board_fm(sp.read_text(encoding="utf-8", errors="replace"))
             g.update({k: fm.get(k, g[k]) for k in g})
+        g["archived"] = (sd.parent.name == "archive")
         sprints[sd.name] = g
     return items, sprints
 
 def _board_card(it, drag=False):
     asg = f'<span class="bchip">{_html.escape(it["assignee"])}</span>' if it["assignee"] else ""
     stg = f'<span class="bstage s-{it["stage"]}">{STAGE_LABEL.get(it["stage"], it["stage"])}</span>'
+    arch = '<span class="bstage" style="background:#6b7280">arsip</span>' if it.get("archived") else ""
     # only tasks are drag-movable (status is a task concept); draggable only in status view
-    can_drag = drag and it["stage"] == "tasks"
+    can_drag = drag and it["stage"] == "tasks" and not it.get("archived")
     dattr = (f' draggable="true" ondragstart="dragStart(event,\'{_html.escape(it["id"])}\')"'
              f' ondragend="dragEnd(event)"') if can_drag else ""
     cls = "bcard drag" if can_drag else "bcard"
-    return (f'<div class="{cls}" data-asg="{_html.escape(it["assignee"])}" data-sprint="{_html.escape(it["sprint"])}"'
-            f' data-id="{_html.escape(it["id"])}"{dattr}>'
+    # tasks open a view/edit/delete modal on click
+    clickable = ' onclick="openTask(this)"' if it["stage"] == "tasks" else ""
+    cur = ' style="cursor:pointer"' if it["stage"] == "tasks" else ""
+    return (f'<div class="{cls}"{cur} data-asg="{_html.escape(it["assignee"])}" data-sprint="{_html.escape(it["sprint"])}"'
+            f' data-id="{_html.escape(it["id"])}" data-stage="{it["stage"]}" data-arch="{"1" if it.get("archived") else ""}"{dattr}{clickable}>'
             f'<div class="bid">{_html.escape(it["id"])}</div>'
             f'<div class="btitle">{_html.escape(it["title"])}</div>'
-            f'<div class="brow">{stg}{asg}</div></div>')
+            f'<div class="brow">{stg}{asg}{arch}</div></div>')
 
-def render_board(view="status", sprint_filter=""):
+def render_board(view="status", sprint_filter="", show_archived=False):
     items, sprints = load_board()
+    # split active vs archived; default board shows active only
+    if show_archived:
+        items = [it for it in items if it.get("archived")]
+    else:
+        items = [it for it in items if not it.get("archived")]
     # sprint filter dropdown
     all_sprints = sorted({it["sprint"] for it in items})
     if sprint_filter:
         items = [it for it in items if it["sprint"] == sprint_filter]
-    # progress per sprint
+    # progress per sprint (match archived scope)
     prog = []
     for sn in sorted(sprints.keys()):
+        if bool(sprints[sn].get("archived")) != bool(show_archived):
+            continue
         ts = [it for it in items if it["sprint"] == sn and it["stage"] == "tasks"]
         done = sum(1 for it in ts if it["status"] == "done")
         total = len(ts)
         pct = int(done * 100 / total) if total else 0
         g = sprints[sn]
-        prog.append(f'<div class="sprog"><div class="sprog-h"><b>{_html.escape(sn)}</b> '
+        sel = " ssel" if sn == sprint_filter else ""
+        href = f'/board?view={view}&sprint={quote(sn)}' + ("&archived=1" if show_archived else "")
+        prog.append(f'<a class="sprog{sel}" href="{href}" title="Lihat task sprint ini"><div class="sprog-h"><b>{_html.escape(sn)}</b> '
                     f'<span class="smeta">{_html.escape(g.get("category") or "")} · {done}/{total} task done</span></div>'
                     f'<div class="sbar"><div class="sfill" style="width:{pct}%"></div></div>'
-                    f'<div class="sgoal">{_html.escape(g.get("goal") or "")}</div></div>')
+                    f'<div class="sgoal">{_html.escape(g.get("goal") or "")}</div></a>')
     prog_html = f'<div class="sprogwrap">{"".join(prog)}</div>' if prog else ""
 
     # columns depend on view
@@ -697,16 +720,18 @@ def render_board(view="status", sprint_filter=""):
         f'<option value="{_html.escape(s)}"{" selected" if s==sprint_filter else ""}>{_html.escape(s)}</option>'
         for s in all_sprints)
     tog = lambda v, lbl: (f'<a class="btn {"g" if v==view else "n"}" '
-                          f'href="/board?view={v}{"&sprint="+quote(sprint_filter) if sprint_filter else ""}">{lbl}</a>')
+                          f'href="/board?view={v}{"&sprint="+quote(sprint_filter) if sprint_filter else ""}{"&archived=1" if show_archived else ""}">{lbl}</a>')
+    arch_tog = (f'<a class="btn {"g" if show_archived else "n"}" '
+                f'href="/board?view={view}{"&archived=1" if not show_archived else ""}">{"📦 Arsip" if not show_archived else "📦 Arsip ✓"}</a>')
     asgs = sorted({it["assignee"] for it in items if it["assignee"]})
     asg_opts = '<option value="">Semua assignee</option>' + "".join(f'<option value="{_html.escape(a)}">{_html.escape(a)}</option>' for a in asgs)
 
     body = f"""
 <div class="treebar noprint" style="align-items:center">
-  {tog("status","🗂 Status")}{tog("stage","🪜 Alur")}
-  <select id="bsprint" onchange="var v=this.value;location.href='/board?view={view}'+(v?'&sprint='+encodeURIComponent(v):'')">{sprint_opts}</select>
+  {tog("status","🗂 Status")}{tog("stage","🪜 Alur")}{arch_tog}
+  <select id="bsprint" onchange="var v=this.value;location.href='/board?view={view}'+(v?'&sprint='+encodeURIComponent(v):'')+'{"&archived=1" if show_archived else ""}'">{sprint_opts}</select>
   <select id="basg" onchange="filterAsg(this.value)">{asg_opts}</select>
-  <span class="smeta">{len(items)} item</span>
+  <span class="smeta">{len(items)} item{" · ARSIP" if show_archived else ""}</span>
 </div>
 {prog_html}
 <div class="bhint noprint" style="color:#6b7280;font-size:12px;margin:-4px 0 8px">{"💡 Seret kartu Task antar-kolom untuk ubah status (tersimpan ke board + sync artifact)." if is_status else "🪜 Mode Alur: kolom = tahap produk (read-only). Beralih ke Status untuk drag-ubah status."}</div>
@@ -736,6 +761,74 @@ function recount(){{document.querySelectorAll('.bcol').forEach(function(col){{
   var body=col.querySelector('.bcol-body');var e=body.querySelector('.bempty');
   var n=body.querySelectorAll('.bcard').length;if(e)e.style.display=n?'none':'';
   col.querySelector('.bcnt').textContent=n;}});}}
+// ---- task view/edit/delete modal ----
+var _tStatus=['todo','in-progress','blocked','review','done'];
+function _esc(s){{return (s==null?'':String(s)).replace(/[&<>"]/g,function(c){{return {{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}}[c];}});}}
+function openTask(card){{
+  if(card.classList.contains('dragging'))return;
+  var id=card.dataset.id, archived=card.dataset.arch==='1';
+  fetch('/api/board/task?id='+encodeURIComponent(id)).then(function(r){{return r.json();}}).then(function(r){{
+    if(!r.ok){{toast('✗ '+r.msg);return;}}
+    var t=r.task; _showTaskView(t, archived);
+  }}).catch(function(){{toast('Error jaringan');}});
+}}
+function _bmodal(title,html){{
+  var m=document.getElementById('bmodal');
+  if(!m){{m=document.createElement('div');m.id='bmodal';m.className='modal';m.innerHTML='<div class="modal-box"><h3 id="bmt"></h3><div id="bmb"></div></div>';document.body.appendChild(m);
+    m.addEventListener('click',function(e){{if(e.target===m)closeBModal();}});}}
+  document.getElementById('bmt').textContent=title;document.getElementById('bmb').innerHTML=html;m.classList.add('open');
+}}
+function closeBModal(){{var m=document.getElementById('bmodal');if(m)m.classList.remove('open');}}
+function _showTaskView(t, archived){{
+  var acc=(t.acceptance||[]).map(function(a){{return '<li>'+_esc(a)+'</li>';}}).join('')||'<li class=smeta>—</li>';
+  var ro=archived?' <span class="bstage" style="background:#6b7280">arsip (read-only)</span>':'';
+  var html=''
+    +'<div class="brow" style="margin-bottom:10px">'
+    +'<span class="bstage s-tasks">'+_esc(t.id)+'</span>'
+    +'<span class="bchip">'+_esc(t.status)+'</span>'
+    +'<span class="bchip">'+_esc(t.assignee||'-')+'</span>'+ro+'</div>'
+    +'<p style="font-size:15px;font-weight:600;margin:0 0 8px">'+_esc(t.title)+'</p>'
+    +'<label>Deskripsi</label><div class="tdesc">'+_esc(t.description||'—')+'</div>'
+    +'<label>Acceptance</label><ul style="margin:4px 0 0;padding-left:18px">'+acc+'</ul>'
+    +'<div class="modal-actions">'
+    +(archived?'':'<button class="btn n" onclick="_editTask('+"'"+_esc(t.id)+"'"+')">✏️ Edit</button>'
+      +'<button class="btn" style="background:#dc2626;color:#fff" onclick="_delTask('+"'"+_esc(t.id)+"'"+')">🗑 Hapus</button>')
+    +'<button class="btn n" onclick="closeBModal()">Tutup</button></div>';
+  _bmodal('Task '+t.id, html);
+  window._curTask=t;
+}}
+function _editTask(id){{
+  var t=window._curTask;if(!t)return;
+  var opts=_tStatus.map(function(s){{return '<option value="'+s+'"'+(s===t.status?' selected':'')+'>'+s+'</option>';}}).join('');
+  var acc=(t.acceptance||[]).join('\\n');
+  var html=''
+    +'<label>Judul</label><input id="et_title" value="'+_esc(t.title)+'">'
+    +'<label>Status</label><select id="et_status">'+opts+'</select>'
+    +'<label>Assignee</label><select id="et_assignee"><option value="agy"'+(t.assignee==='agy'?' selected':'')+'>agy</option><option value="kirocrew"'+(t.assignee==='kirocrew'?' selected':'')+'>kirocrew</option></select>'
+    +'<label>Deskripsi</label><textarea id="et_desc" style="min-height:140px">'+_esc(t.description||'')+'</textarea>'
+    +'<label>Acceptance (satu per baris)</label><textarea id="et_acc" style="min-height:90px">'+_esc(acc)+'</textarea>'
+    +'<div class="modal-actions"><button class="btn n" onclick="_showTaskView(window._curTask,false)">Batal</button>'
+    +'<button class="btn g" onclick="_saveTask('+"'"+_esc(id)+"'"+')">💾 Simpan</button></div>';
+  _bmodal('Edit '+id, html);
+}}
+function _saveTask(id){{
+  var fd=new FormData();fd.append('id',id);
+  fd.append('title',document.getElementById('et_title').value);
+  fd.append('status',document.getElementById('et_status').value);
+  fd.append('assignee',document.getElementById('et_assignee').value);
+  fd.append('description',document.getElementById('et_desc').value);
+  fd.append('acceptance',document.getElementById('et_acc').value);
+  fetch('/api/board/edit',{{method:'POST',body:fd}}).then(function(r){{return r.json();}}).then(function(r){{
+    toast(r.ok?('✓ '+r.msg):('✗ '+r.msg));if(r.ok){{closeBModal();setTimeout(function(){{location.reload();}},500);}}}})
+    .catch(function(){{toast('Error jaringan');}});
+}}
+function _delTask(id){{
+  if(!confirm('Hapus task '+id+'? (dipindah ke .trash, bisa dipulihkan manual)'))return;
+  var fd=new FormData();fd.append('id',id);
+  fetch('/api/board/delete',{{method:'POST',body:fd}}).then(function(r){{return r.json();}}).then(function(r){{
+    toast(r.ok?('✓ '+r.msg):('✗ '+r.msg));if(r.ok){{closeBModal();setTimeout(function(){{location.reload();}},500);}}}})
+    .catch(function(){{toast('Error jaringan');}});
+}}
 </script>"""
     extra = """<style>
 .bboard{display:flex;gap:10px;overflow-x:auto;padding:4px 0 16px;-webkit-overflow-scrolling:touch}
@@ -756,7 +849,10 @@ function recount(){{document.querySelectorAll('.bcol').forEach(function(col){{
 .s-specs{background:#10b981}.s-tasks{background:#ef4444}.s-reports{background:#6366f1}
 .bempty{color:#9ca3af;text-align:center;padding:12px;font-size:13px}
 .sprogwrap{display:flex;flex-direction:column;gap:8px;margin:4px 0 14px}
-.sprog{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px}
+.sprog{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;display:block;text-decoration:none;color:inherit;transition:border-color .15s,box-shadow .15s}
+.sprog:hover{border-color:#2563eb;box-shadow:0 2px 8px rgba(37,99,235,.12)}
+.sprog.ssel{border-color:#2563eb;box-shadow:0 0 0 2px #2563eb33}
+.tdesc{white-space:pre-wrap;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:10px;font-size:13px;color:#374151;max-height:260px;overflow:auto}
 .sprog-h{display:flex;justify-content:space-between;align-items:baseline;font-size:14px}
 .smeta{color:#6b7280;font-size:12px}
 .sbar{height:7px;background:#e5e7eb;border-radius:999px;margin:7px 0 4px;overflow:hidden}
@@ -795,6 +891,69 @@ def op_board_task_status(task_id, new_status):
     return True, f"{task_id} -> {new_status}"
 
 
+def _find_task_file(task_id, include_archive=True):
+    """Resolve a task id -> its JSON file path (board-wide, incl. archive)."""
+    if not BOARD_DIR.is_dir():
+        return None
+    for f in BOARD_DIR.rglob(f"{task_id}*.json"):
+        if f.parent.name != "tasks":
+            continue
+        in_archive = "archive" in f.relative_to(BOARD_DIR).parts
+        if in_archive and not include_archive:
+            continue
+        return f
+    return None
+
+def op_board_task_get(task_id):
+    if not _BOARD_ID_RE.match(task_id or ""):
+        return False, "id task tidak valid"
+    f = _find_task_file(task_id)
+    if f is None:
+        return False, "task tidak ditemukan"
+    try:
+        t = json.loads(f.read_text(encoding="utf-8"))
+    except Exception as e:
+        return False, f"JSON rusak: {e}"
+    t["_archived"] = "archive" in f.relative_to(BOARD_DIR).parts
+    t["_sprint"] = next((p for p in f.relative_to(BOARD_DIR).parts if p.startswith("sprint-")), "")
+    return True, t
+
+def op_board_task_edit(task_id, fields):
+    """Edit editable fields of a task JSON (title/description/status/assignee/acceptance)."""
+    if not _BOARD_ID_RE.match(task_id or ""):
+        return False, "id task tidak valid"
+    f = _find_task_file(task_id, include_archive=False)
+    if f is None:
+        return False, "task aktif tidak ditemukan"
+    try:
+        t = json.loads(f.read_text(encoding="utf-8"))
+    except Exception as e:
+        return False, f"JSON rusak: {e}"
+    if fields.get("status") and fields["status"] not in TASK_STATUS:
+        return False, f"status tidak sah: {fields['status']}"
+    if fields.get("assignee") and fields["assignee"] not in ("kirocrew", "agy"):
+        return False, "assignee harus kirocrew/agy"
+    for k in ("title", "description", "status", "assignee"):
+        if k in fields and fields[k] != "":
+            t[k] = fields[k]
+    if fields.get("acceptance"):
+        t["acceptance"] = [l.strip() for l in fields["acceptance"].splitlines() if l.strip()]
+    t["updated"] = now_iso()
+    f.write_text(json.dumps(t, ensure_ascii=False, indent=2), encoding="utf-8")
+    return True, f"{task_id} tersimpan"
+
+def op_board_task_delete(task_id):
+    if not _BOARD_ID_RE.match(task_id or ""):
+        return False, "id task tidak valid"
+    f = _find_task_file(task_id, include_archive=False)
+    if f is None:
+        return False, "task aktif tidak ditemukan"
+    TRASH.mkdir(exist_ok=True)
+    dest = TRASH / f"{task_id}.{int(datetime.datetime.now().timestamp())}.json"
+    shutil.move(str(f), str(dest))
+    return True, f"{task_id} dihapus (ke .trash)"
+
+
 class H(BaseHTTPRequestHandler):
     def _send(self, body, ct="text/html; charset=utf-8", code=200):
         b = body.encode("utf-8") if isinstance(body, str) else body
@@ -812,7 +971,13 @@ class H(BaseHTTPRequestHandler):
             qs = parse_qs(self.path.split("?",1)[1]) if "?" in self.path else {}
             view = (qs.get("view") or ["status"])[0]
             sprint = (qs.get("sprint") or [""])[0]
-            return self._send(render_board("stage" if view=="stage" else "status", sprint))
+            archived = (qs.get("archived") or [""])[0] in ("1", "true", "yes")
+            return self._send(render_board("stage" if view=="stage" else "status", sprint, archived))
+        if path == "/api/board/task":
+            qs = parse_qs(self.path.split("?",1)[1]) if "?" in self.path else {}
+            tid = (qs.get("id") or [""])[0]
+            ok, r = op_board_task_get(tid)
+            return self._json({"ok": ok, "task": r if ok else None, "msg": "" if ok else r})
         m = re.match(r"^/edit/artifact/(.+)$", path)
         if m:
             return self._send(render_editor(m.group(1)))
@@ -895,6 +1060,15 @@ class H(BaseHTTPRequestHandler):
                 return self._json({"ok": ok, "msg": "Diimport" if ok else r})
             if path == "/api/board/status":
                 ok, r = op_board_task_status(form.get("id",""), form.get("status",""))
+                return self._json({"ok": ok, "msg": r})
+            if path == "/api/board/edit":
+                ok, r = op_board_task_edit(form.get("id",""), {
+                    "title": form.get("title",""), "description": form.get("description",""),
+                    "status": form.get("status",""), "assignee": form.get("assignee",""),
+                    "acceptance": form.get("acceptance","")})
+                return self._json({"ok": ok, "msg": r})
+            if path == "/api/board/delete":
+                ok, r = op_board_task_delete(form.get("id",""))
                 return self._json({"ok": ok, "msg": r})
         except Exception as e:
             return self._json({"ok": False, "msg": f"error: {e}"}, code=500)

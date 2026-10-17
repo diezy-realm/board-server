@@ -1,0 +1,936 @@
+#!/usr/bin/env python3
+"""Artifact server + manager for Tailscale serve.
+
+Read: index (folder tree, date-desc, filters) + render md->HTML + print-to-PDF.
+Write (synced to the native artifact store on disk):
+  - move artifact to a folder/subfolder
+  - edit artifact content (versioned)
+  - create new file (artifact) / new folder, at a chosen path
+  - delete artifact (soft-delete to .trash)
+  - import uploaded .md/.html/.json file
+Artifacts are flat files (<id>/meta.json + current.html + versions/) plus
+artifact_folders.json -- there is NO separate DB/cache, so writing the same
+schema IS the sync. Bind 127.0.0.1; expose via `tailscale serve`.
+
+ponytail: markdown renderer is a minimal regex pass (known ceiling, not
+CommonMark). Write ops guard-railed: soft-delete, versioned edits, folder-json
+backup before mutate.
+"""
+import html as _html
+import json
+import re
+import secrets
+import shutil
+import socketserver
+import datetime
+from http.server import BaseHTTPRequestHandler
+from pathlib import Path
+from urllib.parse import unquote, quote, parse_qs
+
+HOST = "127.0.0.1"
+PORT = 8787
+HOME = Path.home()
+CREW = HOME / ".kiro" / "crew"
+ART_DIR = CREW / "artifacts"
+DOCS_DIR = CREW / "published" / "docs"
+FOLDERS_JSON = CREW / "artifact_folders.json"
+TRASH = ART_DIR / ".trash"
+BOARD_DIR = HOME / "Apps" / "board"  # Scrum board SSOT (git-local, not pushed); read-only view here
+
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+def new_id(n=16):
+    return secrets.token_hex(n // 2)
+
+# ---------- minimal markdown -> HTML ----------
+def _inline(s):
+    s = _html.escape(s)
+    s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
+    s = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s)
+    s = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<em>\1</em>", s)
+    s = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2" rel="noopener">\1</a>', s)
+    return s
+
+def md_to_html(md):
+    lines = md.replace("\r\n", "\n").split("\n")
+    out, i, n = [], 0, len(lines)
+    in_fence, fence_buf, list_stack = False, [], []
+    def close_lists():
+        while list_stack:
+            out.append(f"</{list_stack.pop()}>")
+    while i < n:
+        line = lines[i]
+        if line.strip().startswith("```"):
+            if not in_fence:
+                close_lists(); in_fence = True; fence_buf = []
+            else:
+                out.append("<pre><code>" + _html.escape("\n".join(fence_buf)) + "</code></pre>"); in_fence = False
+            i += 1; continue
+        if in_fence:
+            fence_buf.append(line); i += 1; continue
+        stripped = line.strip()
+        if "|" in line and i + 1 < n and re.match(r"^\s*\|?[\s:|-]+\|?\s*$", lines[i+1]):
+            close_lists()
+            header = [c.strip() for c in line.strip().strip("|").split("|")]
+            out.append("<table><thead><tr>" + "".join(f"<th>{_inline(h)}</th>" for h in header) + "</tr></thead><tbody>")
+            i += 2
+            while i < n and "|" in lines[i]:
+                cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+                out.append("<tr>" + "".join(f"<td>{_inline(c)}</td>" for c in cells) + "</tr>"); i += 1
+            out.append("</tbody></table>"); continue
+        if re.match(r"^\s*(---|\*\*\*|___)\s*$", line):
+            close_lists(); out.append("<hr>"); i += 1; continue
+        m = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if m:
+            close_lists(); lvl = len(m.group(1)); out.append(f"<h{lvl}>{_inline(m.group(2))}</h{lvl}>"); i += 1; continue
+        if stripped.startswith(">"):
+            close_lists(); out.append("<blockquote>" + _inline(stripped[1:].strip()) + "</blockquote>"); i += 1; continue
+        m = re.match(r"^(\s*)[-*+]\s+(.*)$", line)
+        if m:
+            if not list_stack or list_stack[-1] != "ul":
+                close_lists(); out.append("<ul>"); list_stack.append("ul")
+            out.append(f"<li>{_inline(m.group(2))}</li>"); i += 1; continue
+        m = re.match(r"^(\s*)\d+\.\s+(.*)$", line)
+        if m:
+            if not list_stack or list_stack[-1] != "ol":
+                close_lists(); out.append("<ol>"); list_stack.append("ol")
+            out.append(f"<li>{_inline(m.group(2))}</li>"); i += 1; continue
+        if not stripped:
+            close_lists(); i += 1; continue
+        close_lists(); out.append(f"<p>{_inline(stripped)}</p>"); i += 1
+    if in_fence:
+        out.append("<pre><code>" + _html.escape("\n".join(fence_buf)) + "</code></pre>")
+    close_lists()
+    return "\n".join(out)
+
+# ---------- styles ----------
+PAGE_CSS = """
+*{box-sizing:border-box}
+body{margin:0;font:16px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  color:#1a1a1a;background:#f6f7f9;-webkit-text-size-adjust:100%}
+.wrap{max-width:860px;margin:0 auto;padding:16px}
+details>summary{list-style:none}details>summary::-webkit-details-marker{display:none}details>summary::marker{content:""}
+header{position:sticky;top:0;background:#111827;color:#fff;padding:10px 14px;z-index:20;
+  display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+header a{color:#93c5fd;text-decoration:none}
+header .t{font-weight:600;font-size:16px;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.btn{display:inline-block;background:#2563eb;color:#fff;border:0;border-radius:8px;
+  padding:8px 13px;font-size:14px;text-decoration:none;cursor:pointer}
+.btn.g{background:#059669}.btn.r{background:#dc2626}.btn.n{background:#374151}
+.card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;margin:8px 0;
+  box-shadow:0 1px 2px rgba(0,0,0,.04);display:flex;align-items:flex-start;gap:10px}
+.card .body{flex:1;min-width:0}
+.card a.title{font-size:16px;font-weight:600;color:#111827;text-decoration:none}
+.card .acts{display:flex;gap:6px;flex-shrink:0}
+.icon{border:1px solid #e5e7eb;background:#f9fafb;border-radius:7px;padding:5px 8px;font-size:13px;
+  cursor:pointer;text-decoration:none;color:#374151;line-height:1}
+.icon.r{color:#dc2626;border-color:#fecaca;background:#fef2f2}
+.meta{color:#6b7280;font-size:13px;margin-top:4px}
+.badge{display:inline-block;font-size:11px;padding:2px 8px;border-radius:999px;margin-right:6px}
+.badge.md{background:#dbeafe;color:#1e40af}.badge.widget{background:#dcfce7;color:#166534}
+.badge.doc{background:#fef3c7;color:#92400e}.badge.pin{background:#fce7f3;color:#9d174d}
+.content{background:#fff;border-radius:12px;padding:20px;margin-top:12px}
+.content h1{font-size:1.6em;border-bottom:2px solid #eee;padding-bottom:.3em}
+.content h2{font-size:1.3em;border-bottom:1px solid #eee;padding-bottom:.2em}
+.content code{background:#f3f4f6;padding:2px 5px;border-radius:4px;font-size:.9em}
+.content pre{background:#1f2937;color:#e5e7eb;padding:14px;border-radius:8px;overflow-x:auto}
+.content pre code{background:none;color:inherit;padding:0}
+.content table{border-collapse:collapse;width:100%;display:block;overflow-x:auto;font-size:14px}
+.content th,.content td{border:1px solid #e5e7eb;padding:7px 10px;text-align:left}.content th{background:#f9fafb}
+.content blockquote{border-left:4px solid #93c5fd;margin:0;padding:4px 14px;color:#4b5563;background:#f8fafc}
+.content img{max-width:100%}
+.search{width:100%;padding:11px 14px;border:1px solid #d1d5db;border-radius:10px;font-size:15px;margin:8px 0 4px}
+.filters{display:flex;gap:8px;flex-wrap:wrap;margin:4px 0 8px}
+.filters select{flex:1;min-width:120px;padding:9px 10px;border:1px solid #d1d5db;border-radius:9px;font-size:14px;background:#fff;color:#111827}
+.btn-reset{padding:9px 14px;border:1px solid #d1d5db;border-radius:9px;background:#f3f4f6;color:#374151;font-size:14px;cursor:pointer}
+.treebar{display:flex;gap:8px;margin:0 0 10px;flex-wrap:wrap}
+.folder{margin:6px 0}
+.folder>.grp-body{margin-left:10px;border-left:2px solid #e5e7eb;padding-left:8px}
+summary.grp-h{font-size:14px;color:#374151;margin:4px 0;padding:8px 12px;background:#eef2f7;border-radius:8px;
+  display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none}
+.grp-h .arrow{display:inline-block;width:0;height:0;border-left:6px solid #64748b;border-top:5px solid transparent;border-bottom:5px solid transparent;transition:transform .15s}
+details[open]>summary.grp-h .arrow{transform:rotate(90deg)}
+.grp-h .cnt{margin-left:auto;background:#2563eb;color:#fff;border-radius:999px;font-size:11px;padding:1px 8px}
+.grp-h .facts{display:flex;gap:4px;margin-left:6px}
+.empty{color:#6b7280;text-align:center;padding:40px}
+.dd{position:relative;display:inline-block}
+.dd-menu{display:none;position:absolute;right:0;top:110%;background:#fff;border:1px solid #e5e7eb;border-radius:9px;
+  box-shadow:0 4px 14px rgba(0,0,0,.12);z-index:30;min-width:150px;overflow:hidden}
+.dd-menu a{display:block;padding:10px 14px;color:#111827;text-decoration:none;font-size:14px}
+.dd-menu a:hover{background:#f3f4f6}
+.dd.open .dd-menu{display:block}
+.modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:100;align-items:center;justify-content:center;padding:16px}
+.modal.open{display:flex}
+.modal-box{background:#fff;border-radius:14px;max-width:720px;width:100%;max-height:90vh;overflow:auto;padding:18px}
+.modal-box h3{margin:0 0 12px}
+.modal-box label{display:block;font-size:13px;color:#374151;margin:10px 0 4px;font-weight:600}
+.modal-box input,.modal-box select,.modal-box textarea{width:100%;padding:10px;border:1px solid #d1d5db;border-radius:9px;font-size:14px;font-family:inherit}
+.modal-box textarea{min-height:300px;font-family:ui-monospace,Menlo,monospace;font-size:13px}
+.modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#111827;color:#fff;padding:10px 18px;border-radius:10px;z-index:200;display:none}
+@media print{header,.noprint,.acts,.treebar,.filters,.search{display:none}.content{box-shadow:none;border:0;padding:0}body{background:#fff}}
+"""
+
+WIDGET_VARS = """
+:root{--background:#0f172a;--bg:#0f172a;--surface:#1e293b;--surface-raised:#273449;--card:#1e293b;--card-bg:#1e293b;
+--panel:#1e293b;--border:#334155;--border-color:#334155;--text:#e5e7eb;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;
+--text-muted:#94a3b8;--text-dim:#94a3b8;--muted:#94a3b8;--fg:#e5e7eb;--foreground:#e5e7eb;--primary:#60a5fa;--accent:#60a5fa;
+--link:#93c5fd;--success:#4ade80;--warning:#fbbf24;--danger:#f87171;--error:#f87171;--info:#60a5fa;--code-bg:#0b1220;--radius:10px;}
+html,body{background:var(--background);color:var(--text)}a{color:var(--link)}
+"""
+
+def shell(title, body, extra_head="", show_pdf=False, pdf_href=""):
+    pdf = f'<a class="btn noprint" href="{pdf_href}">⬇ PDF</a>' if show_pdf else ""
+    return f"""<!doctype html><html lang="id"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{_html.escape(title)}</title><style>{PAGE_CSS}</style>{extra_head}</head><body>
+<header><a href="/">← Index</a><span class="t">{_html.escape(title)}</span>{pdf}</header>
+<div class="wrap">{body}</div>
+<div class="toast" id="toast"></div></body></html>"""
+
+def wrap_widget(title, raw, aid=""):
+    edit = f'&nbsp;&nbsp;<a href="/edit/artifact/{quote(aid)}" style="color:#fbbf24;text-decoration:none">✎ Edit</a>' if aid else ""
+    bar = (f'<div style="position:sticky;top:0;z-index:9999;background:#111827;color:#fff;'
+           f'padding:10px 16px;font:600 15px -apple-system,sans-serif">'
+           f'<a href="/" style="color:#93c5fd;text-decoration:none">← Index</a>{edit}'
+           f'&nbsp;&nbsp;<span style="opacity:.85">{_html.escape(title)}</span></div>')
+    style = f"<style>{WIDGET_VARS}</style>"
+    low = raw.lower()
+    if "<head" in low:
+        out = re.sub(r"(<head[^>]*>)", r"\1" + style, raw, count=1, flags=re.I)
+    elif "<body" in low:
+        out = re.sub(r"(<body[^>]*>)", r"\1" + style, raw, count=1, flags=re.I)
+    else:
+        out = style + raw
+    if "<body" in out.lower():
+        out = re.sub(r"(<body[^>]*>)", r"\1" + bar, out, count=1, flags=re.I)
+    else:
+        out = bar + out
+    return out
+
+# ---------- folders ----------
+def read_folders():
+    try:
+        return json.loads(FOLDERS_JSON.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return []
+
+def write_folders(rows):
+    if FOLDERS_JSON.exists():
+        bak = FOLDERS_JSON.with_suffix(".json.bak")
+        try: shutil.copy2(FOLDERS_JSON, bak)
+        except Exception: pass
+    FOLDERS_JSON.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def folder_map():
+    rows = read_folders()
+    by_id = {r["id"]: r for r in rows if r.get("id")}
+    def path_of(fid):
+        parts, seen = [], set()
+        while fid and fid in by_id and fid not in seen:
+            seen.add(fid); parts.append(by_id[fid].get("name") or fid); fid = by_id[fid].get("parent_id") or ""
+        return " / ".join(reversed(parts))
+    # path -> id (for resolving a chosen folder path to an id)
+    path2id = {}
+    for r in rows:
+        path2id[path_of(r["id"])] = r["id"]
+    return by_id, path_of, path2id
+
+def ensure_folder_path(path):
+    """Resolve/create a '/'-joined folder path, return its folder id ('' for root)."""
+    path = (path or "").strip()
+    if not path or path == "(Tanpa Folder)":
+        return ""
+    rows = read_folders()
+    by_id = {r["id"]: r for r in rows}
+    def path_of(fid):
+        parts, seen = [], set()
+        while fid and fid in by_id and fid not in seen:
+            seen.add(fid); parts.append(by_id[fid].get("name") or fid); fid = by_id[fid].get("parent_id") or ""
+        return " / ".join(reversed(parts))
+    name2 = {path_of(r["id"]): r["id"] for r in rows}
+    parts = [p.strip() for p in path.split("/") if p.strip()]
+    parent, cur = "", ""
+    changed = False
+    for i, p in enumerate(parts):
+        cur = " / ".join(parts[:i+1])
+        if cur in name2:
+            parent = name2[cur]; continue
+        fid = new_id(12)
+        rows.append({"icon": "📁", "id": fid, "name": p, "order": len(rows), "parent_id": parent})
+        by_id[fid] = rows[-1]; name2[cur] = fid; parent = fid; changed = True
+    if changed:
+        write_folders(rows)
+    return parent
+
+# ---------- artifacts ----------
+def read_meta(aid):
+    mp = ART_DIR / aid / "meta.json"
+    if not mp.is_file():
+        return None
+    try:
+        return json.loads(mp.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return None
+
+def write_meta(aid, meta):
+    (ART_DIR / aid / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def load_artifacts():
+    _, path_of, _ = folder_map()
+    items = []
+    if ART_DIR.is_dir():
+        for d in sorted(ART_DIR.iterdir()):
+            if d.name.startswith("."):
+                continue
+            m = read_meta(d.name)
+            if m is None:
+                continue
+            fid = m.get("folder_id") or ""
+            fpath = path_of(fid) if fid else ""
+            items.append({
+                "id": d.name, "name": m.get("name") or d.name,
+                "kind": "md" if m.get("kind") in ("md", "markdown") else m.get("kind", "widget"),
+                "created": m.get("created_at") or "", "date": (m.get("created_at") or "")[:10],
+                "pinned": bool(m.get("pinned")), "tags": m.get("tags") or [], "src": "artifact",
+                "folder": fpath or "(Tanpa Folder)",
+            })
+    if DOCS_DIR.is_dir():
+        for f in sorted(DOCS_DIR.rglob("*")):
+            if f.suffix.lower() in (".md", ".html", ".htm") and f.is_file():
+                rel = f.relative_to(DOCS_DIR).as_posix()
+                sub = str(f.parent.relative_to(DOCS_DIR)).replace(".", "")
+                try:
+                    mt = datetime.datetime.fromtimestamp(f.stat().st_mtime).isoformat()
+                except Exception:
+                    mt = ""
+                items.append({"id": rel, "name": f.stem,
+                    "kind": "md" if f.suffix.lower()==".md" else "widget",
+                    "created": mt, "date": mt[:10], "pinned": False, "tags": [], "src": "doc",
+                    "folder": ("docs / " + sub) if sub else "docs"})
+    items.sort(key=lambda x: x["created"], reverse=True)
+    items.sort(key=lambda x: x["pinned"], reverse=True)
+    return items
+
+def read_artifact(src, aid):
+    if src == "artifact":
+        d = ART_DIR / aid; cp = d / "current.html"
+        if not cp.is_file(): return None
+        m = read_meta(aid) or {}
+        k = m.get("kind", "widget")
+        return {"name": m.get("name") or aid, "kind": "md" if k in ("md","markdown") else k,
+                "raw": cp.read_text(encoding="utf-8", errors="replace")}
+    else:
+        f = DOCS_DIR / aid
+        if ".." in aid or not f.is_file(): return None
+        return {"name": f.stem, "kind": "md" if f.suffix.lower()==".md" else "widget",
+                "raw": f.read_text(encoding="utf-8", errors="replace")}
+
+# ----- write ops (each returns (ok, msg)) -----
+_ID_RE = re.compile(r"^[0-9a-zA-Z][0-9a-zA-Z._-]*$")
+def _valid_id(aid):
+    return bool(aid) and ".." not in aid and "/" not in aid and bool(_ID_RE.match(aid)) and (ART_DIR / aid).is_dir()
+
+def op_create_artifact(name, kind, folder_path, content=""):
+    aid = new_id(16)
+    d = ART_DIR / aid; (d / "versions").mkdir(parents=True, exist_ok=True)
+    (d / "current.html").write_text(content, encoding="utf-8")
+    (d / "versions" / "v1.html").write_text(content, encoding="utf-8")
+    fid = ensure_folder_path(folder_path)
+    meta = {"auto_registered": False, "created_at": now_iso(), "description": "",
+            "events": [{"by": "manager", "ts": now_iso(), "type": "created", "version": 1}],
+            "folder_id": fid, "image": None, "kind": "markdown" if kind=="md" else kind,
+            "kind_auto": False, "name": name or "Untitled", "pinned": False, "slug": aid,
+            "source": "manual", "tags": [], "updated_at": now_iso(), "version": 1,
+            "version_kinds": {"1": "markdown" if kind=="md" else kind}}
+    write_meta(aid, meta)
+    return True, aid
+
+def op_create_folder(name, parent_path):
+    fid = ensure_folder_path(((parent_path + " / ") if parent_path and parent_path!="(Tanpa Folder)" else "") + name)
+    return True, fid
+
+def op_move(aid, folder_path):
+    if not _valid_id(aid): return False, "invalid id"
+    m = read_meta(aid)
+    if m is None: return False, "not found"
+    m["folder_id"] = ensure_folder_path(folder_path)
+    m["updated_at"] = now_iso()
+    m.setdefault("events", []).append({"by":"manager","ts":now_iso(),"type":"moved","version":m.get("version",1)})
+    write_meta(aid, m); return True, "moved"
+
+def op_edit(aid, content):
+    if not _valid_id(aid): return False, "invalid id"
+    m = read_meta(aid)
+    if m is None: return False, "not found"
+    d = ART_DIR / aid; (d/"versions").mkdir(exist_ok=True)
+    ver = int(m.get("version", 1)) + 1
+    (d/"versions"/f"v{ver}.html").write_text(content, encoding="utf-8")
+    (d/"current.html").write_text(content, encoding="utf-8")
+    m["version"] = ver; m["updated_at"] = now_iso()
+    vk = m.get("version_kinds") or {}; vk[str(ver)] = m.get("kind","widget"); m["version_kinds"]=vk
+    m.setdefault("events", []).append({"by":"manager","ts":now_iso(),"type":"edited","version":ver})
+    write_meta(aid, m); return True, f"saved v{ver}"
+
+def op_delete(aid):
+    if not _valid_id(aid): return False, "invalid id"
+    d = ART_DIR / aid
+    if not d.is_dir(): return False, "not found"
+    TRASH.mkdir(exist_ok=True)
+    dest = TRASH / f"{aid}.{int(datetime.datetime.now().timestamp())}"
+    shutil.move(str(d), str(dest)); return True, "deleted (soft)"
+
+def op_import(filename, data_bytes, folder_path):
+    name = Path(filename).stem
+    ext = Path(filename).suffix.lower()
+    try:
+        content = data_bytes.decode("utf-8")
+    except Exception:
+        return False, "file bukan teks (utf-8)"
+    kind = "md" if ext == ".md" else ("widget" if ext in (".html",".htm") else "md")
+    return op_create_artifact(name, kind, folder_path, content)
+
+# ---------- index ----------
+def _card_html(it):
+    href = f'/view/{it["src"]}/{quote(it["id"])}'
+    kind = it["kind"]
+    badge_cls = "md" if kind=="md" else ("doc" if it["src"]=="doc" else "widget")
+    label = "MD" if kind=="md" else ("DOC" if it["src"]=="doc" else "HTML")
+    badges = f'<span class="badge {badge_cls}">{label}</span>'
+    if it["pinned"]:
+        badges += '<span class="badge pin">★</span>'
+    meta = " · ".join(x for x in [it["date"], " ".join(it["tags"][:3])] if x)
+    fmt = "md" if kind=="md" else ("doc" if it["src"]=="doc" else "html")
+    sk = _html.escape((it["name"]+" "+" ".join(it["tags"])+" "+it["folder"]).lower())
+    acts = ""
+    if it["src"] == "artifact":
+        acts = (f'<div class="acts noprint">'
+                f'<a class="icon" href="/edit/artifact/{quote(it["id"])}" title="Edit">✎</a>'
+                f'<a class="icon" href="#" title="Pindahkan" onclick="mv(\'{it["id"]}\');return false">↪</a>'
+                f'<a class="icon r" href="#" title="Hapus" onclick="del(\'{it["id"]}\',\'{_html.escape(it["name"])}\');return false">🗑</a>'
+                f'</div>')
+    return (f'<div class="card" data-s="{sk}" data-date="{_html.escape(it["date"])}" data-fmt="{fmt}" data-folder="{_html.escape(it["folder"])}">'
+            f'<div class="body"><a class="title" href="{href}">{_html.escape(it["name"])}</a>'
+            f'<div class="meta">{badges}{_html.escape(meta)}</div></div>{acts}</div>')
+
+def _folder_actions(path):
+    p = _html.escape(path)
+    return (f'<span class="dd" onclick="event.preventDefault();event.stopPropagation();this.classList.toggle(\'open\')">'
+            f'<a class="icon" title="Buat">＋</a>'
+            f'<span class="dd-menu">'
+            f'<a href="#" onclick="newFile(\'{p}\');return false">📄 New File</a>'
+            f'<a href="#" onclick="newFolder(\'{p}\');return false">📁 New Folder</a>'
+            f'</span></span>')
+
+def render_index():
+    items = load_artifacts()
+    def new_node(): return {"children": {}, "items": []}
+    root, no_folder = new_node(), new_node()
+    for it in items:
+        if it["folder"] == "(Tanpa Folder)":
+            no_folder["items"].append(it); continue
+        node = root
+        for p in [x.strip() for x in it["folder"].split("/") if x.strip()]:
+            node = node["children"].setdefault(p, new_node())
+        node["items"].append(it)
+    def sub_count(nd): return len(nd["items"]) + sum(sub_count(c) for c in nd["children"].values())
+    def render_node(name, node, path, depth):
+        full = (path + " / " + name) if path else name
+        inner = []
+        for cn in sorted(node["children"].keys(), key=str.lower):
+            inner.append(render_node(cn, node["children"][cn], full, depth+1))
+        inner.extend(_card_html(it) for it in node["items"])
+        return (f'<details class="folder" data-folder="{_html.escape(full)}" open>'
+                f'<summary class="grp-h" style="margin-left:{depth*12}px">'
+                f'<span class="arrow"></span>📁 {_html.escape(name)}'
+                f'<span class="cnt">{sub_count(node)}</span>'
+                f'<span class="facts noprint">{_folder_actions(full)}</span></summary>'
+                f'<div class="grp-body">{"".join(inner)}</div></details>')
+    sections = [render_node(n, root["children"][n], "", 0) for n in sorted(root["children"].keys(), key=str.lower)]
+    if no_folder["items"]:
+        sections.append(f'<details class="folder" data-folder="(Tanpa Folder)" open>'
+            f'<summary class="grp-h"><span class="arrow"></span>📂 (Tanpa Folder)'
+            f'<span class="cnt">{len(no_folder["items"])}</span>'
+            f'<span class="facts noprint">{_folder_actions("(Tanpa Folder)")}</span></summary>'
+            f'<div class="grp-body">{"".join(_card_html(it) for it in no_folder["items"])}</div></details>')
+    all_dates = sorted({it["date"] for it in items if it["date"]}, reverse=True)
+    all_folders = sorted({it["folder"] for it in items}, key=lambda n:(n=="(Tanpa Folder)", n.lower()))
+    date_opts = '<option value="">Semua tanggal</option>'+"".join(f'<option value="{d}">{d}</option>' for d in all_dates)
+    fmt_sel = "".join(f'<option value="{v}">{t}</option>' for v,t in
+        [("","Semua format"),("md","Markdown"),("html","Widget/HTML"),("doc","Dokumen")])
+    folder_sel = '<option value="">Semua folder</option>'+"".join(f'<option value="{_html.escape(f)}">{_html.escape(f)}</option>' for f in all_folders)
+    # folder options for move/create modals (all known folder paths + root)
+    _,_,path2id = folder_map()
+    all_paths = [""]+sorted([p for p in path2id if p], key=str.lower)
+    move_opts = "".join(f'<option value="{_html.escape(p)}">{_html.escape(p) if p else "(root / Tanpa Folder)"}</option>' for p in all_paths)
+
+    body = f"""
+<input class="search" id="q" placeholder="🔍 Cari ({len(items)} item)..." oninput="applyF()">
+<div class="filters">
+  <select id="fDate" onchange="applyF()">{date_opts}</select>
+  <select id="fFmt" onchange="applyF()">{fmt_sel}</select>
+  <select id="fFolder" onchange="applyF()">{folder_sel}</select>
+  <button class="btn-reset noprint" onclick="resetF()">Reset</button>
+</div>
+<div class="treebar noprint">
+  <a class="btn" href="/board" style="background:#7c3aed">📋 Board</a>
+  <button class="btn-reset" onclick="setAll(true)">Expand semua</button>
+  <button class="btn-reset" onclick="setAll(false)">Collapse semua</button>
+  <button class="btn g" onclick="newFile('')">＋ New File</button>
+  <button class="btn n" onclick="newFolder('')">📁 New Folder</button>
+  <button class="btn n" onclick="openImport()">⬆ Import</button>
+</div>
+<div id="list">{''.join(sections) if sections else '<div class="empty">Belum ada artifact.</div>'}</div>
+
+<div class="modal" id="modal"><div class="modal-box">
+  <h3 id="mTitle"></h3><div id="mBody"></div>
+  <div class="modal-actions">
+    <button class="btn-reset" onclick="closeModal()">Batal</button>
+    <button class="btn" id="mOk" onclick="submitModal()">OK</button>
+  </div>
+</div></div>
+
+<script>
+var MOVE_OPTS = `{move_opts}`;
+function cardVisible(c,q,fd,ff,fo){{
+  return c.dataset.s.indexOf(q)>-1 && (!fd||c.dataset.date===fd) && (!ff||c.dataset.fmt===ff)
+    && (!fo||c.dataset.folder===fo||c.dataset.folder.indexOf(fo+' / ')===0);}}
+function applyF(){{
+  var q=q_.value.toLowerCase(),fd=fDate.value,ff=fFmt.value,fo=fFolder.value,filtering=q||fd||ff||fo;
+  document.querySelectorAll('.card').forEach(function(c){{c.style.display=cardVisible(c,q,fd,ff,fo)?'':'none';}});
+  document.querySelectorAll('details.folder').forEach(function(d){{
+    var vis=Array.prototype.filter.call(d.querySelectorAll('.card'),function(c){{return c.style.display!=='none';}}).length;
+    d.style.display=vis>0?'':'none';var cnt=d.querySelector('.cnt');if(cnt)cnt.textContent=vis;if(filtering)d.open=true;}});}}
+function resetF(){{q_.value='';fDate.value='';fFmt.value='';fFolder.value='';applyF();}}
+function setAll(o){{document.querySelectorAll('details.folder').forEach(function(d){{d.open=o;}});}}
+var q_=document.getElementById('q'),fDate=document.getElementById('fDate'),fFmt=document.getElementById('fFmt'),fFolder=document.getElementById('fFolder');
+var modal=document.getElementById('modal'),mTitle=document.getElementById('mTitle'),mBody=document.getElementById('mBody');
+var _submit=null;
+function openModal(t,html,fn){{mTitle.textContent=t;mBody.innerHTML=html;_submit=fn;modal.classList.add('open');}}
+function closeModal(){{modal.classList.remove('open');_submit=null;}}
+function submitModal(){{if(_submit)_submit();}}
+function toast(m){{var t=document.getElementById('toast');t.textContent=m;t.style.display='block';setTimeout(function(){{t.style.display='none';}},2200);}}
+function post(url,data,cb){{var fd=new FormData();for(var k in data)fd.append(k,data[k]);
+  fetch(url,{{method:'POST',body:fd}}).then(function(r){{return r.json();}}).then(cb).catch(function(e){{toast('Error: '+e);}});}}
+function newFile(path){{openModal('New File','<label>Nama</label><input id="x1" placeholder="Judul file">'
+  +'<label>Format</label><select id="x2"><option value="md">Markdown (.md)</option><option value="html">Widget/HTML</option></select>'
+  +'<label>Folder</label><select id="x3">'+MOVE_OPTS+'</select>'
+  +'<label>Isi</label><textarea id="x4" placeholder="# Judul\\n\\nIsi..."></textarea>',function(){{
+    var f=document.getElementById('x3');f.value=path;
+    post('/api/create',{{name:document.getElementById('x1').value,kind:document.getElementById('x2').value,
+      folder:f.value,content:document.getElementById('x4').value}},function(r){{closeModal();toast(r.msg||'dibuat');location.reload();}});}});
+  setTimeout(function(){{document.getElementById('x3').value=path;}},0);}}
+function newFolder(path){{openModal('New Folder','<label>Nama folder</label><input id="x1" placeholder="nama-folder">'
+  +'<label>Di dalam</label><select id="x2">'+MOVE_OPTS+'</select>',function(){{
+    post('/api/mkdir',{{name:document.getElementById('x1').value,parent:document.getElementById('x2').value}},
+      function(r){{closeModal();toast(r.msg||'dibuat');location.reload();}});}});
+  setTimeout(function(){{document.getElementById('x2').value=path;}},0);}}
+function mv(id){{openModal('Pindahkan ke folder','<label>Folder tujuan</label><select id="x1">'+MOVE_OPTS+'</select>',function(){{
+  post('/api/move',{{id:id,folder:document.getElementById('x1').value}},function(r){{closeModal();toast(r.msg||'dipindah');location.reload();}});}});}}
+function del(id,name){{if(!confirm('Hapus "'+name+'"? (soft-delete, bisa dipulihkan dari .trash)'))return;
+  post('/api/delete',{{id:id}},function(r){{toast(r.msg||'dihapus');location.reload();}});}}
+function openImport(){{openModal('Import file','<label>Pilih file (.md/.html)</label><input type="file" id="x1" accept=".md,.html,.htm,.txt">'
+  +'<label>Folder tujuan</label><select id="x2">'+MOVE_OPTS+'</select>',function(){{
+    var f=document.getElementById('x1');if(!f.files.length){{toast('pilih file dulu');return;}}
+    var fd=new FormData();fd.append('file',f.files[0]);fd.append('folder',document.getElementById('x2').value);
+    fetch('/api/import',{{method:'POST',body:fd}}).then(function(r){{return r.json();}}).then(function(r){{closeModal();toast(r.msg||'diimport');location.reload();}});}});}}
+</script>"""
+    return shell("Artifact Library", body)
+
+def render_editor(aid):
+    m = read_meta(aid)
+    if m is None:
+        return shell("Not found", '<div class="empty">Artifact tidak ditemukan.</div>')
+    raw = (ART_DIR/aid/"current.html").read_text(encoding="utf-8", errors="replace")
+    name = _html.escape(m.get("name") or aid)
+    body = f"""
+<h3>✎ Edit: {name}</h3>
+<p class="meta">Perubahan disimpan sebagai versi baru (versioned). Format: {m.get('kind')}</p>
+<textarea id="ed" style="width:100%;min-height:60vh;font-family:ui-monospace,monospace;font-size:13px;padding:12px;border:1px solid #d1d5db;border-radius:10px">{_html.escape(raw)}</textarea>
+<div class="treebar"><button class="btn g" onclick="save()">💾 Simpan</button>
+<a class="btn-reset" href="/view/artifact/{quote(aid)}">Lihat</a>
+<a class="btn-reset" href="/">← Index</a></div>
+<div class="toast" id="toast"></div>
+<script>
+function save(){{var fd=new FormData();fd.append('id','{aid}');fd.append('content',document.getElementById('ed').value);
+  fetch('/api/edit',{{method:'POST',body:fd}}).then(function(r){{return r.json();}}).then(function(r){{
+    var t=document.getElementById('toast');t.textContent=r.msg||'tersimpan';t.style.display='block';
+    setTimeout(function(){{t.style.display='none';}},2000);}});}}
+</script>"""
+    return shell(f"Edit {m.get('name') or aid}", body)
+
+# ---------- board (Scrum tracking view) ----------
+BOARD_STAGES = ["stories", "backlog", "prd", "specs", "tasks", "reports"]
+STAGE_LABEL = {"stories": "Story", "backlog": "Backlog", "prd": "PRD",
+               "specs": "Spec", "tasks": "Task", "reports": "Report"}
+# status Kanban columns (union across types, ordered left->right)
+STATUS_COLS = ["todo", "in-progress", "blocked", "review", "done"]
+STATUS_LABEL = {"todo": "To Do", "in-progress": "In Progress", "blocked": "Blocked",
+                "review": "Review", "done": "Done", "draft": "To Do", "ready": "To Do",
+                "in-backlog": "To Do", "refined": "To Do", "approved": "Review",
+                "implemented": "Done", "in-review": "Review", "partial": "Review", "failed": "Blocked"}
+
+def _board_fm(text):
+    """Parse YAML front-matter (reuse same shape as validate.parse_frontmatter)."""
+    m = re.match(r"^---\s*\n(.*?)\n---\s*\n?", text, re.S)
+    if not m:
+        return {}
+    out = {}
+    for line in m.group(1).splitlines():
+        line = line.split("#", 1)[0].rstrip()
+        if not line.strip() or ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+def load_board():
+    """Scan ~/Apps/board -> list of items with stage, status, sprint, assignee.
+    Reads disk every call (auto-load, no cache), same contract as artifacts."""
+    items, sprints = [], {}
+    if not BOARD_DIR.is_dir():
+        return items, sprints
+    for f in sorted(BOARD_DIR.rglob("*")):
+        if not f.is_file():
+            continue
+        stage = f.parent.name
+        if stage not in BOARD_STAGES:
+            continue
+        is_task = (stage == "tasks")
+        if is_task != (f.suffix == ".json"):
+            continue
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        if is_task:
+            try:
+                meta = json.loads(text)
+            except Exception:
+                meta = {}
+        else:
+            meta = _board_fm(text)
+        # locate sprint (sprints/sprint-NN/...) vs product-backlog
+        parts = f.relative_to(BOARD_DIR).parts
+        sprint = parts[1] if parts and parts[0] == "sprints" and len(parts) > 1 else "product-backlog"
+        status_raw = (meta.get("status") or "todo").lower()
+        items.append({
+            "id": meta.get("id") or f.stem, "title": meta.get("title") or f.stem,
+            "stage": stage, "status": status_raw, "assignee": meta.get("assignee") or "",
+            "sprint": sprint, "rel": f.relative_to(BOARD_DIR).as_posix(),
+        })
+    # sprint goals/status
+    for sd in sorted((BOARD_DIR / "sprints").glob("sprint-*")) if (BOARD_DIR / "sprints").is_dir() else []:
+        sp = sd / "SPRINT.md"
+        g = {"goal": "", "category": "", "status": "active"}
+        if sp.is_file():
+            fm = _board_fm(sp.read_text(encoding="utf-8", errors="replace"))
+            g.update({k: fm.get(k, g[k]) for k in g})
+        sprints[sd.name] = g
+    return items, sprints
+
+def _board_card(it, drag=False):
+    asg = f'<span class="bchip">{_html.escape(it["assignee"])}</span>' if it["assignee"] else ""
+    stg = f'<span class="bstage s-{it["stage"]}">{STAGE_LABEL.get(it["stage"], it["stage"])}</span>'
+    # only tasks are drag-movable (status is a task concept); draggable only in status view
+    can_drag = drag and it["stage"] == "tasks"
+    dattr = (f' draggable="true" ondragstart="dragStart(event,\'{_html.escape(it["id"])}\')"'
+             f' ondragend="dragEnd(event)"') if can_drag else ""
+    cls = "bcard drag" if can_drag else "bcard"
+    return (f'<div class="{cls}" data-asg="{_html.escape(it["assignee"])}" data-sprint="{_html.escape(it["sprint"])}"'
+            f' data-id="{_html.escape(it["id"])}"{dattr}>'
+            f'<div class="bid">{_html.escape(it["id"])}</div>'
+            f'<div class="btitle">{_html.escape(it["title"])}</div>'
+            f'<div class="brow">{stg}{asg}</div></div>')
+
+def render_board(view="status", sprint_filter=""):
+    items, sprints = load_board()
+    # sprint filter dropdown
+    all_sprints = sorted({it["sprint"] for it in items})
+    if sprint_filter:
+        items = [it for it in items if it["sprint"] == sprint_filter]
+    # progress per sprint
+    prog = []
+    for sn in sorted(sprints.keys()):
+        ts = [it for it in items if it["sprint"] == sn and it["stage"] == "tasks"]
+        done = sum(1 for it in ts if it["status"] == "done")
+        total = len(ts)
+        pct = int(done * 100 / total) if total else 0
+        g = sprints[sn]
+        prog.append(f'<div class="sprog"><div class="sprog-h"><b>{_html.escape(sn)}</b> '
+                    f'<span class="smeta">{_html.escape(g.get("category") or "")} · {done}/{total} task done</span></div>'
+                    f'<div class="sbar"><div class="sfill" style="width:{pct}%"></div></div>'
+                    f'<div class="sgoal">{_html.escape(g.get("goal") or "")}</div></div>')
+    prog_html = f'<div class="sprogwrap">{"".join(prog)}</div>' if prog else ""
+
+    # columns depend on view
+    if view == "stage":
+        cols = BOARD_STAGES
+        col_label = lambda c: STAGE_LABEL[c]
+        bucket = lambda it: it["stage"]
+    else:  # status
+        cols = STATUS_COLS
+        col_label = lambda c: STATUS_LABEL[c]
+        def bucket(it):
+            s = it["status"]
+            return s if s in STATUS_COLS else {"draft":"todo","ready":"todo","in-backlog":"todo",
+                "refined":"todo","approved":"review","implemented":"done","in-review":"review",
+                "partial":"review","failed":"blocked"}.get(s, "todo")
+
+    is_status = (view != "stage")
+    colmap = {c: [] for c in cols}
+    for it in items:
+        b = bucket(it)
+        if b in colmap:
+            colmap[b].append(it)
+    col_html = []
+    for c in cols:
+        cards = colmap[c]
+        drop = (f' ondragover="dragOver(event)" ondrop="dropCard(event,\'{c}\')"'
+                f' ondragleave="dragLeave(event)"') if is_status else ""
+        col_html.append(
+            f'<div class="bcol" data-col="{c}"><div class="bcol-h">{col_label(c)}<span class="bcnt">{len(cards)}</span></div>'
+            f'<div class="bcol-body"{drop}>{"".join(_board_card(it, drag=is_status) for it in cards) or "<div class=bempty>—</div>"}</div></div>')
+
+    sprint_opts = '<option value="">Semua sprint</option>' + "".join(
+        f'<option value="{_html.escape(s)}"{" selected" if s==sprint_filter else ""}>{_html.escape(s)}</option>'
+        for s in all_sprints)
+    tog = lambda v, lbl: (f'<a class="btn {"g" if v==view else "n"}" '
+                          f'href="/board?view={v}{"&sprint="+quote(sprint_filter) if sprint_filter else ""}">{lbl}</a>')
+    asgs = sorted({it["assignee"] for it in items if it["assignee"]})
+    asg_opts = '<option value="">Semua assignee</option>' + "".join(f'<option value="{_html.escape(a)}">{_html.escape(a)}</option>' for a in asgs)
+
+    body = f"""
+<div class="treebar noprint" style="align-items:center">
+  {tog("status","🗂 Status")}{tog("stage","🪜 Alur")}
+  <select id="bsprint" onchange="var v=this.value;location.href='/board?view={view}'+(v?'&sprint='+encodeURIComponent(v):'')">{sprint_opts}</select>
+  <select id="basg" onchange="filterAsg(this.value)">{asg_opts}</select>
+  <span class="smeta">{len(items)} item</span>
+</div>
+{prog_html}
+<div class="bhint noprint" style="color:#6b7280;font-size:12px;margin:-4px 0 8px">{"💡 Seret kartu Task antar-kolom untuk ubah status (tersimpan ke board + sync artifact)." if is_status else "🪜 Mode Alur: kolom = tahap produk (read-only). Beralih ke Status untuk drag-ubah status."}</div>
+<div class="bboard">{"".join(col_html)}</div>
+<div class="toast" id="toast"></div>
+<script>
+function filterAsg(a){{document.querySelectorAll('.bcard').forEach(function(c){{
+  c.style.display=(!a||c.dataset.asg===a)?'':'none';}});
+  document.querySelectorAll('.bcol').forEach(function(col){{
+    var n=Array.prototype.filter.call(col.querySelectorAll('.bcard'),function(c){{return c.style.display!=='none';}}).length;
+    col.querySelector('.bcnt').textContent=n;}});}}
+function toast(m){{var t=document.getElementById('toast');if(!t)return;t.textContent=m;t.style.display='block';setTimeout(function(){{t.style.display='none';}},2200);}}
+var _dragId=null;
+function dragStart(e,id){{_dragId=id;e.dataTransfer.effectAllowed='move';try{{e.dataTransfer.setData('text/plain',id);}}catch(_){{}} e.target.classList.add('dragging');}}
+function dragEnd(e){{e.target.classList.remove('dragging');document.querySelectorAll('.bcol-body.over').forEach(function(x){{x.classList.remove('over');}});}}
+function dragOver(e){{e.preventDefault();e.dataTransfer.dropEffect='move';e.currentTarget.classList.add('over');}}
+function dragLeave(e){{e.currentTarget.classList.remove('over');}}
+function dropCard(e,status){{e.preventDefault();e.currentTarget.classList.remove('over');
+  var id=_dragId||e.dataTransfer.getData('text/plain');if(!id)return;
+  var card=document.querySelector('.bcard[data-id="'+id+'"]');
+  if(card){{e.currentTarget.appendChild(card);recount();}}
+  var fd=new FormData();fd.append('id',id);fd.append('status',status);
+  fetch('/api/board/status',{{method:'POST',body:fd}}).then(function(r){{return r.json();}}).then(function(r){{
+    toast(r.ok?('✓ '+r.msg):('✗ '+r.msg));if(!r.ok)setTimeout(function(){{location.reload();}},800);}})
+    .catch(function(){{toast('Error jaringan');setTimeout(function(){{location.reload();}},800);}});}}
+function recount(){{document.querySelectorAll('.bcol').forEach(function(col){{
+  var body=col.querySelector('.bcol-body');var e=body.querySelector('.bempty');
+  var n=body.querySelectorAll('.bcard').length;if(e)e.style.display=n?'none':'';
+  col.querySelector('.bcnt').textContent=n;}});}}
+</script>"""
+    extra = """<style>
+.bboard{display:flex;gap:10px;overflow-x:auto;padding:4px 0 16px;-webkit-overflow-scrolling:touch}
+.bcol{flex:0 0 240px;min-width:240px;background:#eef2f7;border-radius:12px;padding:8px}
+.bcol-h{font-weight:700;font-size:13px;color:#374151;padding:6px 8px;display:flex;align-items:center;gap:6px}
+.bcnt{margin-left:auto;background:#2563eb;color:#fff;border-radius:999px;font-size:11px;padding:1px 8px}
+.bcol-body{display:flex;flex-direction:column;gap:8px;min-height:20px}
+.bcard{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:9px 11px;box-shadow:0 1px 2px rgba(0,0,0,.05)}
+.bcard.drag{cursor:grab}
+.bcard.dragging{opacity:.5;cursor:grabbing}
+.bcol-body.over{outline:2px dashed #2563eb;outline-offset:2px;border-radius:8px;background:#dbeafe55}
+.bid{font:600 11px ui-monospace,monospace;color:#2563eb}
+.btitle{font-size:14px;color:#111827;margin:3px 0 6px;line-height:1.35}
+.brow{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.bchip{font-size:11px;background:#f3e8ff;color:#6b21a8;border-radius:999px;padding:1px 8px}
+.bstage{font-size:10px;border-radius:999px;padding:1px 7px;color:#fff}
+.s-stories{background:#8b5cf6}.s-backlog{background:#0ea5e9}.s-prd{background:#f59e0b}
+.s-specs{background:#10b981}.s-tasks{background:#ef4444}.s-reports{background:#6366f1}
+.bempty{color:#9ca3af;text-align:center;padding:12px;font-size:13px}
+.sprogwrap{display:flex;flex-direction:column;gap:8px;margin:4px 0 14px}
+.sprog{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px}
+.sprog-h{display:flex;justify-content:space-between;align-items:baseline;font-size:14px}
+.smeta{color:#6b7280;font-size:12px}
+.sbar{height:7px;background:#e5e7eb;border-radius:999px;margin:7px 0 4px;overflow:hidden}
+.sfill{height:100%;background:#059669;border-radius:999px}
+.sgoal{color:#4b5563;font-size:13px}
+</style>"""
+    return shell("Board — Scrum Tracking", body, extra_head=extra)
+
+# ----- board write op: change a task's status (drag-to-move) -----
+TASK_STATUS = ["todo", "in-progress", "blocked", "review", "done"]
+_BOARD_ID_RE = re.compile(r"^TASK-\d{3,}$")
+
+def op_board_task_status(task_id, new_status):
+    """Set status of a board task (JSON) by its id. Only tasks are drag-movable
+    (status Kanban). Writes the same JSON schema agents read -> auto-synced."""
+    if not task_id or not _BOARD_ID_RE.match(task_id):
+        return False, "id task tidak valid"
+    if new_status not in TASK_STATUS:
+        return False, f"status tidak sah: {new_status}"
+    if not BOARD_DIR.is_dir():
+        return False, "board tidak ditemukan"
+    # find the task file (only inside a tasks/ folder, by id), board-wide but not archive
+    target = None
+    for f in BOARD_DIR.rglob(f"{task_id}*.json"):
+        if f.parent.name == "tasks" and "archive" not in f.relative_to(BOARD_DIR).parts:
+            target = f; break
+    if target is None:
+        return False, "task tidak ditemukan (aktif)"
+    try:
+        t = json.loads(target.read_text(encoding="utf-8"))
+    except Exception as e:
+        return False, f"JSON rusak: {e}"
+    t["status"] = new_status
+    t["updated"] = now_iso()
+    target.write_text(json.dumps(t, ensure_ascii=False, indent=2), encoding="utf-8")
+    return True, f"{task_id} -> {new_status}"
+
+
+class H(BaseHTTPRequestHandler):
+    def _send(self, body, ct="text/html; charset=utf-8", code=200):
+        b = body.encode("utf-8") if isinstance(body, str) else body
+        self.send_response(code); self.send_header("Content-Type", ct)
+        self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+
+    def _json(self, obj, code=200):
+        self._send(json.dumps(obj), ct="application/json", code=code)
+
+    def do_GET(self):
+        path = unquote(self.path.split("?")[0])
+        if path in ("/", ""):
+            return self._send(render_index())
+        if path == "/board":
+            qs = parse_qs(self.path.split("?",1)[1]) if "?" in self.path else {}
+            view = (qs.get("view") or ["status"])[0]
+            sprint = (qs.get("sprint") or [""])[0]
+            return self._send(render_board("stage" if view=="stage" else "status", sprint))
+        m = re.match(r"^/edit/artifact/(.+)$", path)
+        if m:
+            return self._send(render_editor(m.group(1)))
+        m = re.match(r"^/view/(artifact|doc)/(.+)$", path)
+        if m:
+            src, aid = m.group(1), m.group(2); a = read_artifact(src, aid)
+            if not a: return self._send(shell("Not found", '<div class="empty">Tidak ditemukan.</div>'), code=404)
+            if a["kind"] == "md":
+                inner = f'<div class="content">{md_to_html(a["raw"])}</div>'
+                edit = f'<a class="btn n noprint" href="/edit/{src}/{quote(aid)}" style="margin-left:8px">✎ Edit</a>' if src=="artifact" else ""
+                head = f'<header style="display:none"></header>'
+                page = shell(a["name"], f'<div class="treebar noprint"><a class="btn" href="/pdf/{src}/{quote(aid)}">⬇ PDF</a>{edit}</div>'+inner)
+                return self._send(page)
+            else:
+                return self._send(wrap_widget(a["name"], a["raw"], aid if src=="artifact" else ""))
+        m = re.match(r"^/pdf/(artifact|doc)/(.+)$", path)
+        if m:
+            src, aid = m.group(1), m.group(2); a = read_artifact(src, aid)
+            if not a: return self._send(shell("Not found", '<div class="empty">Tidak ditemukan.</div>'), code=404)
+            inner = f'<div class="content">{md_to_html(a["raw"]) if a["kind"]=="md" else a["raw"]}</div>'
+            page = shell(a["name"], inner).replace("</body>", "<script>window.addEventListener('load',function(){setTimeout(function(){window.print()},400)})</script></body>")
+            return self._send(page)
+        return self._send(shell("Not found", '<div class="empty">404</div>'), code=404)
+
+    def _read_body(self):
+        ln = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(ln) if ln else b""
+
+    def _parse_form(self, body):
+        """Parse multipart/form-data OR x-www-form-urlencoded -> dict.
+        File fields become (filename, bytes); text fields become str."""
+        ctype = self.headers.get("Content-Type", "")
+        if "application/x-www-form-urlencoded" in ctype:
+            parsed = parse_qs(body.decode("utf-8", "replace"), keep_blank_values=True)
+            return {k: v[0] for k, v in parsed.items()}
+        m = re.search(r"boundary=(.+)", ctype)
+        if not m: return {}
+        boundary = ("--" + m.group(1).strip()).encode()
+        out = {}
+        for part in body.split(boundary):
+            if not part or part in (b"--\r\n", b"--", b"\r\n"): continue
+            if b"\r\n\r\n" not in part: continue
+            head, data = part.split(b"\r\n\r\n", 1)
+            data = data.rstrip(b"\r\n")
+            hs = head.decode("utf-8", "replace")
+            nm = re.search(r'name="([^"]+)"', hs)
+            fn = re.search(r'filename="([^"]*)"', hs)
+            if not nm: continue
+            if fn:
+                out[nm.group(1)] = (fn.group(1), data)
+            else:
+                out[nm.group(1)] = data.decode("utf-8", "replace")
+        return out
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        body = self._read_body()
+        form = self._parse_form(body)
+        try:
+            if path == "/api/create":
+                ok, r = op_create_artifact(form.get("name","Untitled"), form.get("kind","md"),
+                                           form.get("folder",""), form.get("content",""))
+                return self._json({"ok": ok, "msg": "File dibuat" if ok else r, "id": r if ok else None})
+            if path == "/api/mkdir":
+                ok, r = op_create_folder(form.get("name","folder"), form.get("parent",""))
+                return self._json({"ok": ok, "msg": "Folder dibuat"})
+            if path == "/api/move":
+                ok, r = op_move(form.get("id",""), form.get("folder",""))
+                return self._json({"ok": ok, "msg": "Dipindahkan" if ok else r})
+            if path == "/api/edit":
+                ok, r = op_edit(form.get("id",""), form.get("content",""))
+                return self._json({"ok": ok, "msg": r})
+            if path == "/api/delete":
+                ok, r = op_delete(form.get("id",""))
+                return self._json({"ok": ok, "msg": "Dihapus (ke .trash)" if ok else r})
+            if path == "/api/import":
+                fn, data = form.get("file", ("", b""))
+                if not fn: return self._json({"ok": False, "msg": "tidak ada file"}, code=400)
+                ok, r = op_import(fn, data if isinstance(data, bytes) else data.encode(), form.get("folder",""))
+                return self._json({"ok": ok, "msg": "Diimport" if ok else r})
+            if path == "/api/board/status":
+                ok, r = op_board_task_status(form.get("id",""), form.get("status",""))
+                return self._json({"ok": ok, "msg": r})
+        except Exception as e:
+            return self._json({"ok": False, "msg": f"error: {e}"}, code=500)
+        return self._json({"ok": False, "msg": "unknown endpoint"}, code=404)
+
+    def log_message(self, *a): pass
+
+class S(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address = True; daemon_threads = True
+
+# idle-exit so systemd socket-activation can stop us when nobody is reading
+import os as _os, time as _time, threading as _threading
+IDLE_TIMEOUT = int(_os.environ.get("ARTIFACT_IDLE_TIMEOUT", "300"))  # 0 = never
+_last_hit = _time.monotonic()
+_orig_handle = H.handle
+def _handle(self, *a, **k):
+    globals().__setitem__("_last_hit", _time.monotonic())
+    return _orig_handle(self, *a, **k)
+H.handle = _handle
+
+def _idle_watchdog(srv):
+    while True:
+        _time.sleep(5)
+        if IDLE_TIMEOUT and (_time.monotonic() - _last_hit) > IDLE_TIMEOUT:
+            srv.shutdown(); return
+
+if __name__ == "__main__":
+    import socket as _socket
+    listen_fds = int(_os.environ.get("LISTEN_FDS", "0"))
+    if listen_fds >= 1:
+        # systemd socket-activation: adopt fd 3 (SD_LISTEN_FDS_START)
+        srv = S.__new__(S)
+        S.__init__(srv, (HOST, PORT), H, bind_and_activate=False)
+        srv.socket = _socket.socket(fileno=3)
+    else:
+        srv = S((HOST, PORT), H)
+        print(f"Artifact manager on http://{HOST}:{PORT}")
+    _threading.Thread(target=_idle_watchdog, args=(srv,), daemon=True).start()
+    srv.serve_forever(poll_interval=1)

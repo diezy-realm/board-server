@@ -38,6 +38,169 @@ FOLDERS_JSON = CREW / "artifact_folders.json"
 TRASH = ART_DIR / ".trash"
 BOARD_DIR = HOME / "Apps" / "board"  # Scrum board SSOT (git-local, not pushed); read-only view here
 
+import subprocess as _sp
+
+def bridge_health():
+    """Health of the board->agy bridge (systemd timer) + board task tallies.
+    Read-only: queries `systemctl --user` + `journalctl --user`, no mutation."""
+    def _sc(*args):
+        try:
+            return _sp.run(["systemctl", "--user", *args], capture_output=True,
+                           text=True, timeout=5).stdout.strip()
+        except Exception:
+            return ""
+    timers = {u: (_sc("is-active", f"{u}.timer") or "unknown") for u in TIMERS}
+    active = "active" if all(v == "active" for v in timers.values()) else \
+        ", ".join(f"{u}={v}" for u, v in timers.items() if v != "active")
+    next_trigger = ""
+    try:
+        lt = _sp.run(["systemctl", "--user", "list-timers", "agy-bridge.timer",
+                      "--no-pager", "--all"], capture_output=True, text=True, timeout=5).stdout
+        for ln in lt.splitlines():
+            if "agy-bridge.timer" in ln:
+                next_trigger = " ".join(ln.split()[:3])  # NEXT datetime columns
+                break
+    except Exception:
+        pass
+    last_line, last_when = "", ""
+    try:
+        j = _sp.run(["journalctl", "--user", "-u", "agy-bridge.service",
+                     "--no-pager", "-n", "4", "-o", "short-iso"],
+                    capture_output=True, text=True, timeout=5).stdout.strip().splitlines()
+        for ln in reversed(j):
+            if "env[" in ln or "scan board" in ln or "selesai" in ln or "blocked" in ln:
+                parts = ln.split(" ", 1)
+                last_when = parts[0] if parts else ""
+                last_line = ln.split("]:", 1)[-1].strip() if "]:" in ln else ln
+                break
+    except Exception:
+        pass
+    # task tallies for agy
+    todo = inprog = blocked = done = review = 0
+    if BOARD_DIR.is_dir():
+        for f in BOARD_DIR.rglob("*.json"):
+            if f.parent.name != "tasks" or "archive" in f.relative_to(BOARD_DIR).parts:
+                continue
+            try:
+                t = json.loads(f.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if t.get("assignee") != "agy":
+                continue
+            st = t.get("status")
+            if st == "todo": todo += 1
+            elif st == "in-progress": inprog += 1
+            elif st == "blocked": blocked += 1
+            elif st == "review": review += 1
+            elif st == "done": done += 1
+    healthy = (active == "active")
+    return {
+        "healthy": healthy, "timer_active": active, "next_trigger": next_trigger,
+        "last_when": last_when, "last_line": last_line[:200],
+        "timers": timers,
+        "tasks": {"todo": todo, "in_progress": inprog, "blocked": blocked, "review": review, "done": done},
+    }
+
+import sqlite3 as _sqlite
+BRIDGE_DB = HOME / "Apps" / "board" / "tools" / "agy-bridge" / "bridge_events.db"
+# Timers editable from the board UI (unit name -> label). Whitelist: the unit name is user input.
+TIMERS = {
+    "agy-bridge": "agy run (todo)",
+    "board-unblock": "blocked→todo",
+    "board-review": "review→todo/done",
+    "dev-ci-poller": "CI PR lokal",
+}
+def _timer_file(unit):
+    return HOME / ".config" / "systemd" / "user" / f"{unit}.timer"
+
+def bridge_events(limit=30):
+    """Recent completion/retry/unblock events for the bell dropdown (newest first)."""
+    out = []
+    if not BRIDGE_DB.exists():
+        return out
+    try:
+        c = _sqlite.connect(f"file:{BRIDGE_DB}?mode=ro", uri=True, timeout=5)
+        for r in c.execute("SELECT ts,kind,task_id,title,report,detail FROM events "
+                            "ORDER BY id DESC LIMIT ?", (limit,)):
+            out.append({"ts": r[0], "kind": r[1], "task_id": r[2],
+                        "title": r[3], "report": r[4], "detail": r[5]})
+        c.close()
+    except Exception:
+        pass
+    return out
+
+def bridge_interval_get(unit="agy-bridge"):
+    """Current timer interval in minutes, parsed from the .timer unit."""
+    if unit not in TIMERS:
+        return 5
+    try:
+        txt = _timer_file(unit).read_text(encoding="utf-8")
+        m = re.search(r"OnUnitActiveSec\s*=\s*(\d+)\s*(min|m|s)?", txt)
+        if m:
+            val = int(m.group(1)); unit = (m.group(2) or "s")
+            return val if unit in ("min", "m") else max(1, val // 60)
+    except Exception:
+        pass
+    return 5
+
+def bridge_interval_set(minutes, unit="agy-bridge"):
+    """Rewrite OnUnitActiveSec in the .timer unit (1..1440 min) and reload systemd.
+    Returns (ok, msg)."""
+    if unit not in TIMERS:
+        return False, "timer tidak dikenal"
+    try:
+        minutes = int(minutes)
+    except Exception:
+        return False, "interval tidak valid"
+    if minutes < 1 or minutes > 1440:
+        return False, "interval harus antara 1 menit dan 1 hari (1440 menit)"
+    try:
+        timer_file = _timer_file(unit)
+        txt = timer_file.read_text(encoding="utf-8")
+        new = re.sub(r"OnUnitActiveSec\s*=.*", f"OnUnitActiveSec={minutes}min", txt)
+        if "OnUnitActiveSec" not in new:
+            new = new.replace("[Timer]", f"[Timer]\nOnUnitActiveSec={minutes}min", 1)
+        timer_file.write_text(new, encoding="utf-8")
+        _sp.run(["systemctl", "--user", "daemon-reload"], timeout=10)
+        _sp.run(["systemctl", "--user", "restart", f"{unit}.timer"], timeout=10)
+        return True, f"{TIMERS[unit]}: interval diset ke {minutes} menit"
+    except Exception as e:
+        return False, f"gagal set interval: {e}"
+
+def board_report_html(rpt_id):
+    """Render a board report (~/Apps/board/**/reports/RPT-NNN.md) to HTML. View-only."""
+    if not re.match(r"^RPT-\d+$", rpt_id or ""):
+        return None
+    for f in BOARD_DIR.rglob(f"{rpt_id}.md"):
+        if f.parent.name == "reports":
+            try:
+                return md_to_html(f.read_text(encoding="utf-8", errors="replace"))
+            except Exception:
+                return None
+    return None
+
+def board_task_retry(task_id):
+    """Manual retry: flip a blocked agy task back to todo (resets backoff gate)."""
+    if not re.match(r"^TASK-\d+$", task_id or ""):
+        return False, "id task tidak valid"
+    for f in BOARD_DIR.rglob("*.json"):
+        if f.parent.name != "tasks":
+            continue
+        try:
+            t = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if t.get("id") != task_id:
+            continue
+        if t.get("status") not in ("blocked", "failed"):
+            return False, f"{task_id} tidak blocked (status={t.get('status')})"
+        t["status"] = "todo"; t["updated"] = now_iso()
+        notes = (t.get("notes") or "")
+        t["notes"] = (notes + f" | manual-retry {now_iso()[:16]}").strip(" |")
+        f.write_text(json.dumps(t, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True, f"{task_id} -> todo (retry manual)"
+    return False, "task tidak ditemukan"
+
 def now_iso():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
@@ -649,14 +812,19 @@ def _board_card(it, drag=False):
     dattr = (f' draggable="true" ondragstart="dragStart(event,\'{_html.escape(it["id"])}\')"'
              f' ondragend="dragEnd(event)"') if can_drag else ""
     cls = "bcard drag" if can_drag else "bcard"
-    # tasks open a view/edit/delete modal on click
-    clickable = ' onclick="openTask(this)"' if it["stage"] == "tasks" else ""
-    cur = ' style="cursor:pointer"' if it["stage"] == "tasks" else ""
+    # tasks AND reports open a modal; others (story/backlog/prd/spec) stay static
+    clickable = ' onclick="openCard(this)"' if it["stage"] in ("tasks", "reports") else ""
+    cur = ' style="cursor:pointer"' if it["stage"] in ("tasks", "reports") else ""
+    retry = ""
+    if it["stage"] == "tasks" and it.get("status") in ("blocked", "failed") and it.get("assignee") == "agy":
+        retry = (f'<button onclick="retryTask(\'{_html.escape(it["id"])}\',event)" '
+                 f'style="margin-left:auto;background:#7c3aed;color:#fff;border:none;border-radius:6px;'
+                 f'font-size:11px;padding:2px 8px;cursor:pointer">🔄 retry</button>')
     return (f'<div class="{cls}"{cur} data-asg="{_html.escape(it["assignee"])}" data-sprint="{_html.escape(it["sprint"])}"'
             f' data-id="{_html.escape(it["id"])}" data-stage="{it["stage"]}" data-arch="{"1" if it.get("archived") else ""}"{dattr}{clickable}>'
             f'<div class="bid">{_html.escape(it["id"])}</div>'
             f'<div class="btitle">{_html.escape(it["title"])}</div>'
-            f'<div class="brow">{stg}{asg}{arch}</div></div>')
+            f'<div class="brow" style="display:flex;align-items:center">{stg}{asg}{arch}{retry}</div></div>')
 
 def render_board(view="status", sprint_filter="", show_archived=False):
     items, sprints = load_board()
@@ -732,6 +900,18 @@ def render_board(view="status", sprint_filter="", show_archived=False):
   <select id="bsprint" onchange="var v=this.value;location.href='/board?view={view}'+(v?'&sprint='+encodeURIComponent(v):'')+'{"&archived=1" if show_archived else ""}'">{sprint_opts}</select>
   <select id="basg" onchange="filterAsg(this.value)">{asg_opts}</select>
   <span class="smeta">{len(items)} item{" · ARSIP" if show_archived else ""}</span>
+  <span id="bridgeHealth" class="smeta" style="margin-left:auto;cursor:default" title="Kesehatan bridge agy">⏳ cek bridge…</span>
+  <span class="smeta" style="display:inline-flex;align-items:center;gap:4px" title="Interval cron bridge">
+    <select id="ivTimer" class="btn n" style="padding:3px 6px" onchange="loadInterval()">{"".join(f'<option value="{u}">{l}</option>' for u,l in TIMERS.items())}</select>
+    <input id="ivVal" type="number" min="1" step="1" value="5" style="width:52px;padding:3px 6px;border:1px solid #cbd5e1;border-radius:6px">
+    <select id="ivUnit" class="btn n" style="padding:3px 6px"><option value="minute">minute</option><option value="hours">hours</option><option value="days">days</option></select>
+    <button class="btn g" style="padding:3px 10px" onclick="setInterval_()">set</button>
+  </span>
+  <span id="bellWrap" class="smeta" style="position:relative;cursor:pointer" onclick="bellClick(event)" title="Notifikasi task selesai">🔔<span id="bellBadge" style="display:none;position:absolute;top:-6px;right:-8px;background:#dc2626;color:#fff;border-radius:9px;font-size:10px;padding:0 5px;line-height:15px">0</span></span>
+  <div id="bellPanel" style="display:none;position:absolute;right:16px;top:52px;width:340px;max-height:420px;overflow:auto;background:#111827;color:#e5e7eb;border:1px solid #374151;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.4);z-index:9999">
+    <div style="padding:10px 12px;border-bottom:1px solid #374151;font-weight:600;display:flex;justify-content:space-between;align-items:center">Task selesai (H+7)<span id="bellClear" style="font-size:11px;color:#9ca3af;cursor:pointer">bersihkan badge</span></div>
+    <div id="bellList" style="padding:4px"></div>
+  </div>
 </div>
 {prog_html}
 <div class="bhint noprint" style="color:#6b7280;font-size:12px;margin:-4px 0 8px">{"💡 Seret kartu Task antar-kolom untuk ubah status (tersimpan ke board + sync artifact)." if is_status else "🪜 Mode Alur: kolom = tahap produk (read-only). Beralih ke Status untuk drag-ubah status."}</div>
@@ -761,6 +941,56 @@ function recount(){{document.querySelectorAll('.bcol').forEach(function(col){{
   var body=col.querySelector('.bcol-body');var e=body.querySelector('.bempty');
   var n=body.querySelectorAll('.bcard').length;if(e)e.style.display=n?'none':'';
   col.querySelector('.bcnt').textContent=n;}});}}
+// ---- bridge health + bell dropdown + interval selector + retry ----
+var _lastDone=null, _bellCount=0, _bellOpen=false;
+function bellClick(e){{if(e)e.stopPropagation();_bellOpen=!_bellOpen;
+  var p=document.getElementById('bellPanel');if(!p)return;
+  p.style.display=_bellOpen?'block':'none';
+  if(_bellOpen){{loadEvents();_bellCount=0;var b=document.getElementById('bellBadge');if(b)b.style.display='none';
+    if(window.Notification&&Notification.permission!=='granted'){{try{{Notification.requestPermission();}}catch(_){{}}}}}}}}
+document.addEventListener('click',function(e){{var w=document.getElementById('bellWrap'),p=document.getElementById('bellPanel');
+  if(_bellOpen&&p&&w&&!p.contains(e.target)&&!w.contains(e.target)){{_bellOpen=false;p.style.display='none';}}}});
+function _ico(k){{return k==='done'?'✅':k==='retry'?'🔄':k==='unblock'?'🔓':k==='review'?'🔎':k==='ci-fix'?'🔧':k==='blocked'?'⛔':'•';}}
+function loadEvents(){{fetch('/api/bridge/events').then(function(r){{return r.json();}}).then(function(d){{
+  var el=document.getElementById('bellList');if(!el)return;var ev=d.events||[];
+  if(!ev.length){{el.innerHTML='<div style="padding:14px;color:#9ca3af;font-size:13px">Belum ada event.</div>';return;}}
+  el.innerHTML=ev.map(function(e){{
+    var when=(e.ts||'').replace('T',' ').slice(0,16);
+    var rpt=e.report?(' · <a href="/view/doc/'+encodeURIComponent(e.report)+'" style="color:#93c5fd" target="_blank">'+e.report+'</a>'):'';
+    return '<div style="padding:8px 10px;border-bottom:1px solid #1f2937">'+
+      '<div style="font-size:13px">'+_ico(e.kind)+' <b>'+(e.task_id||'')+'</b> '+(e.title||'').replace(/</g,'&lt;')+'</div>'+
+      '<div style="font-size:11px;color:#9ca3af">'+when+' · '+e.kind+rpt+'</div></div>';}}).join('');}})
+  .catch(function(){{var el=document.getElementById('bellList');if(el)el.innerHTML='<div style="padding:14px;color:#f87171">Gagal memuat event.</div>';}});}}
+var _bc=document.getElementById('bellClear');if(_bc)_bc.onclick=function(ev){{ev.stopPropagation();_bellCount=0;var b=document.getElementById('bellBadge');if(b)b.style.display='none';}};
+function _bell(n){{_bellCount+=n;var b=document.getElementById('bellBadge');if(b){{b.textContent=_bellCount;b.style.display=_bellCount>0?'':'none';}}
+  if(window.Notification&&Notification.permission==='granted'){{try{{new Notification('Board: '+n+' task selesai',{{body:'Tim agy/kiro menyelesaikan task baru.'}});}}catch(_){{}}}}
+  toast('🔔 '+n+' task baru selesai');if(_bellOpen)loadEvents();}}
+function pollBridge(){{fetch('/api/bridge/health').then(function(r){{return r.json();}}).then(function(h){{
+  var el=document.getElementById('bridgeHealth');if(!el)return;
+  var t=h.tasks||{{}}, ic=h.healthy?'🟢':'🔴';
+  el.textContent=ic+' bridge '+(h.timer_active||'?')+' · todo '+(t.todo||0)+' · ⏳'+(t.in_progress||0)+' · ⛔'+(t.blocked||0)+' · 🔎'+(t.review||0)+' · ✅'+(t.done||0);
+  el.title='Last: '+(h.last_when||'?')+' — '+(h.last_line||'')+'\\nNext: '+(h.next_trigger||'?');
+  var d=t.done||0; if(_lastDone!==null && d>_lastDone){{_bell(d-_lastDone);}} _lastDone=d;
+}}).catch(function(){{var el=document.getElementById('bridgeHealth');if(el){{el.textContent='⚠ bridge: tak terjangkau';}}}});}}
+function loadInterval(){{fetch('/api/bridge/interval?unit='+encodeURIComponent(document.getElementById('ivTimer').value)).then(function(r){{return r.json();}}).then(function(d){{
+  var v=document.getElementById('ivVal'), u=document.getElementById('ivUnit');if(!v||!u)return;
+  var mins=d.minutes||5;
+  if(mins%1440===0){{v.value=mins/1440;u.value='days';}}
+  else if(mins%60===0){{v.value=mins/60;u.value='hours';}}
+  else {{v.value=mins;u.value='minute';}}
+}});}}
+function setInterval_(){{var v=document.getElementById('ivVal'), u=document.getElementById('ivUnit');if(!v)return;
+  var n=parseInt(v.value,10);if(!n||n<1){{toast('✗ masukkan angka ≥ 1');return;}}
+  var mult={{minute:1,hours:60,days:1440}}[u.value]||1; var mins=n*mult;
+  var fd=new FormData();fd.append('minutes',mins);fd.append('unit',document.getElementById('ivTimer').value);
+  fetch('/api/bridge/interval',{{method:'POST',body:fd}}).then(function(r){{return r.json();}}).then(function(r){{
+    toast(r.ok?('✓ '+r.msg):('✗ '+r.msg));if(r.ok)setTimeout(pollBridge,800);}});}}
+function retryTask(id,ev){{if(ev)ev.stopPropagation();
+  var fd=new FormData();fd.append('id',id);
+  fetch('/api/board/retry',{{method:'POST',body:fd}}).then(function(r){{return r.json();}}).then(function(r){{
+    toast(r.ok?('🔄 '+r.msg):('✗ '+r.msg));if(r.ok)setTimeout(function(){{location.reload();}},700);}});}}
+if(window.Notification&&Notification.permission==='default'){{try{{Notification.requestPermission();}}catch(_){{}}}}
+pollBridge();loadInterval();setInterval(pollBridge,30000);
 // ---- task view/edit/delete modal ----
 var _tStatus=['todo','in-progress','blocked','review','done'];
 function _esc(s){{return (s==null?'':String(s)).replace(/[&<>"]/g,function(c){{return {{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}}[c];}});}}
@@ -772,6 +1002,32 @@ function openTask(card){{
     var t=r.task; _showTaskView(t, archived);
   }}).catch(function(){{toast('Error jaringan');}});
 }}
+// Dispatch: report cards -> read-only report viewer; task cards -> task modal.
+// Edit/delete allowed ONLY for a task that is NOT archived, NOT in stage(alur)
+// view, and whose status is actionable (blocked/failed/todo/in-progress).
+// Done/review tasks and all reports are view-only (DoD/CI/acceptance).
+function openCard(card){{
+  if(card.classList.contains('dragging'))return;
+  var stage=card.dataset.stage, id=card.dataset.id, archived=card.dataset.arch==='1';
+  if(stage==='reports'){{return _showReportView(id);}}
+  var isStage = (document.querySelector('.treebar .btn.g')||{{}}).textContent||'';
+  var stageView = isStage.indexOf('Alur')>=0;
+  fetch('/api/board/task?id='+encodeURIComponent(id)).then(function(r){{return r.json();}}).then(function(r){{
+    if(!r.ok){{toast('✗ '+r.msg);return;}}
+    var t=r.task||{{}};
+    var editable = !archived && !stageView && ['blocked','failed','todo','in-progress'].indexOf((t.status||'').toLowerCase())>=0;
+    _showTaskView(t, !editable);
+  }}).catch(function(){{toast('Error jaringan');}});
+}}
+function _showReportView(id){{
+  _bmodal('Report '+id, '<div class=smeta style="padding:20px">Memuat…</div>');
+  fetch('/api/board/report?id='+encodeURIComponent(id)).then(function(r){{return r.json();}}).then(function(d){{
+    if(!d.ok){{_bmodal('Report '+id, '<p class=smeta style="padding:20px">'+(d.msg||'Gagal memuat')+'</p>');return;}}
+    var html='<div style="max-height:60vh;overflow:auto;font-size:14px;line-height:1.55">'+d.html+'</div>'
+      +'<div class="modal-actions"><button class="btn n" onclick="closeBModal()">Tutup</button></div>';
+    _bmodal('Report '+id+' (view-only)', html);
+  }}).catch(function(){{_bmodal('Report '+id, '<p class=smeta style="padding:20px">Gagal memuat report.</p>');}});
+}}
 function _bmodal(title,html){{
   var m=document.getElementById('bmodal');
   if(!m){{m=document.createElement('div');m.id='bmodal';m.className='modal';m.innerHTML='<div class="modal-box"><h3 id="bmt"></h3><div id="bmb"></div></div>';document.body.appendChild(m);
@@ -780,8 +1036,11 @@ function _bmodal(title,html){{
 }}
 function closeBModal(){{var m=document.getElementById('bmodal');if(m)m.classList.remove('open');}}
 function _showTaskView(t, archived){{
-  var acc=(t.acceptance||[]).map(function(a){{return '<li>'+_esc(a)+'</li>';}}).join('')||'<li class=smeta>—</li>';
-  var ro=archived?' <span class="bstage" style="background:#6b7280">arsip (read-only)</span>':'';
+  var isDone=(t.status||'').toLowerCase()==='done';
+  var mark=isDone?'✅ ':'☐ ';
+  var acc=(t.acceptance||[]).map(function(a){{return '<li style="list-style:none;margin-left:-18px">'+mark+_esc(a)+'</li>';}}).join('')||'<li class=smeta>—</li>';
+  var ro=archived?' <span class="bstage" style="background:#6b7280">read-only</span>':'';
+  var rpt=t.report?('<label>Report / DoD</label><div class="brow"><a class="btn n" href="/view/doc/'+encodeURIComponent(t.report)+'" target="_blank">📄 '+_esc(t.report)+'</a></div>'):'';
   var html=''
     +'<div class="brow" style="margin-bottom:10px">'
     +'<span class="bstage s-tasks">'+_esc(t.id)+'</span>'
@@ -789,12 +1048,13 @@ function _showTaskView(t, archived){{
     +'<span class="bchip">'+_esc(t.assignee||'-')+'</span>'+ro+'</div>'
     +'<p style="font-size:15px;font-weight:600;margin:0 0 8px">'+_esc(t.title)+'</p>'
     +'<label>Deskripsi</label><div class="tdesc">'+_esc(t.description||'—')+'</div>'
-    +'<label>Acceptance</label><ul style="margin:4px 0 0;padding-left:18px">'+acc+'</ul>'
+    +'<label>'+(isDone?'Definition of Done (acceptance)':'Acceptance')+'</label><ul style="margin:4px 0 0;padding-left:18px">'+acc+'</ul>'
+    +rpt
     +'<div class="modal-actions">'
     +(archived?'':'<button class="btn n" onclick="_editTask('+"'"+_esc(t.id)+"'"+')">✏️ Edit</button>'
       +'<button class="btn" style="background:#dc2626;color:#fff" onclick="_delTask('+"'"+_esc(t.id)+"'"+')">🗑 Hapus</button>')
     +'<button class="btn n" onclick="closeBModal()">Tutup</button></div>';
-  _bmodal('Task '+t.id, html);
+  _bmodal('Task '+t.id+(archived?' (view-only)':''), html);
   window._curTask=t;
 }}
 function _editTask(id){{
@@ -978,6 +1238,18 @@ class H(BaseHTTPRequestHandler):
             tid = (qs.get("id") or [""])[0]
             ok, r = op_board_task_get(tid)
             return self._json({"ok": ok, "task": r if ok else None, "msg": "" if ok else r})
+        if path == "/api/bridge/health":
+            return self._json({"ok": True, **bridge_health()})
+        if path == "/api/bridge/events":
+            return self._json({"ok": True, "events": bridge_events()})
+        if path == "/api/bridge/interval":
+            qs = parse_qs(self.path.split("?",1)[1]) if "?" in self.path else {}
+            return self._json({"ok": True, "minutes": bridge_interval_get((qs.get("unit") or ["agy-bridge"])[0])})
+        if path == "/api/board/report":
+            qs = parse_qs(self.path.split("?",1)[1]) if "?" in self.path else {}
+            rid = (qs.get("id") or [""])[0]
+            h = board_report_html(rid)
+            return self._json({"ok": h is not None, "html": h or "", "msg": "" if h else "report tak ditemukan"})
         m = re.match(r"^/edit/artifact/(.+)$", path)
         if m:
             return self._send(render_editor(m.group(1)))
@@ -1037,6 +1309,12 @@ class H(BaseHTTPRequestHandler):
         body = self._read_body()
         form = self._parse_form(body)
         try:
+            if path == "/api/board/retry":
+                ok, r = board_task_retry(form.get("id",""))
+                return self._json({"ok": ok, "msg": r})
+            if path == "/api/bridge/interval":
+                ok, r = bridge_interval_set(form.get("minutes","5"), form.get("unit","agy-bridge"))
+                return self._json({"ok": ok, "msg": r})
             if path == "/api/create":
                 ok, r = op_create_artifact(form.get("name","Untitled"), form.get("kind","md"),
                                            form.get("folder",""), form.get("content",""))

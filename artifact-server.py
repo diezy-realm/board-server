@@ -108,7 +108,6 @@ TIMERS = {
     "agy-bridge": "agy run (todo)",
     "board-unblock": "blocked→todo",
     "board-review": "review→todo/done",
-    "dev-ci-poller": "CI PR lokal",
 }
 def _timer_file(unit):
     return HOME / ".config" / "systemd" / "user" / f"{unit}.timer"

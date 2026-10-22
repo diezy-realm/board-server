@@ -1721,7 +1721,7 @@ function bellClick(e){{if(e)e.stopPropagation();_bellOpen=!_bellOpen;
   var p=document.getElementById('bellPanel');if(!p)return;
   p.style.display=_bellOpen?'block':'none';
   if(_bellOpen){{loadEvents();_bellCount=0;var b=document.getElementById('bellBadge');if(b)b.style.display='none';
-    if(window.Notification&&Notification.permission!=='granted'){{try{{Notification.requestPermission();}}catch(_){{}}}}}}}}
+    if(window.Notification&&window.Notification.permission!=='granted'){{try{{window.Notification.requestPermission();}}catch(_){{}}}}}}}}
 document.addEventListener('click',function(e){{var w=document.getElementById('bellWrap'),p=document.getElementById('bellPanel');
   if(_bellOpen&&p&&w&&!p.contains(e.target)&&!w.contains(e.target)){{_bellOpen=false;p.style.display='none';}}}});
 function _ico(k){{return k==='done'?'✅':k==='retry'?'🔄':k==='unblock'?'🔓':k==='review'?'🔎':k==='ci-fix'?'🔧':k==='blocked'?'⛔':'•';}}
@@ -1730,14 +1730,14 @@ function loadEvents(){{fetch('/api/bridge/events').then(function(r){{return r.js
   if(!ev.length){{el.innerHTML='<div style="padding:14px;color:#9ca3af;font-size:13px">Belum ada event.</div>';return;}}
   el.innerHTML=ev.map(function(e){{
     var when=(e.ts||'').replace('T',' ').slice(0,16);
-    var rpt=e.report?(' · <a href="javascript:void(0)" onclick="_showReportView(\''+encodeURIComponent(e.report)+'\')" style="color:#93c5fd">'+e.report+'</a>'):'';
+    var rpt=e.report?(' · <a href="javascript:void(0)" data-rpt="'+encodeURIComponent(e.report)+'" onclick="_showReportView(decodeURIComponent(this.dataset.rpt))" style="color:#93c5fd">'+_esc(e.report)+'</a>'):'';
     return '<div style="padding:8px 10px;border-bottom:1px solid #1f2937">'+
       '<div style="font-size:13px">'+_ico(e.kind)+' <b>'+(e.task_id||'')+'</b> '+(e.title||'').replace(/</g,'&lt;')+'</div>'+
       '<div style="font-size:11px;color:#9ca3af">'+when+' · '+e.kind+rpt+'</div></div>';}}).join('');}})
   .catch(function(){{var el=document.getElementById('bellList');if(el)el.innerHTML='<div style="padding:14px;color:#f87171">Gagal memuat event.</div>';}});}}
 var _bc=document.getElementById('bellClear');if(_bc)_bc.onclick=function(ev){{ev.stopPropagation();_bellCount=0;var b=document.getElementById('bellBadge');if(b)b.style.display='none';}};
 function _bell(n){{_bellCount+=n;var b=document.getElementById('bellBadge');if(b){{b.textContent=_bellCount;b.style.display=_bellCount>0?'':'none';}}
-  if(window.Notification&&Notification.permission==='granted'){{try{{new Notification('Board: '+n+' task selesai',{{body:'Tim agy/kiro menyelesaikan task baru.'}});}}catch(_){{}}}}
+  if(window.Notification&&window.Notification.permission==='granted'){{try{{new window.Notification('Board: '+n+' task selesai',{{body:'Tim agy/kiro menyelesaikan task baru.'}});}}catch(_){{}}}}
   toast('🔔 '+n+' task baru selesai');if(_bellOpen)loadEvents();}}
 function pollBridge(){{fetch('/api/bridge/health').then(function(r){{return r.json();}}).then(function(h){{
   var el=document.getElementById('bridgeHealth');if(!el)return;
@@ -1763,7 +1763,7 @@ function retryTask(id,ev){{if(ev)ev.stopPropagation();
   var fd=new FormData();fd.append('id',id);
   fetch('/api/board/retry',{{method:'POST',body:fd}}).then(function(r){{return r.json();}}).then(function(r){{
     toast(r.ok?('🔄 '+r.msg):('✗ '+r.msg));if(r.ok)setTimeout(function(){{location.reload();}},700);}});}}
-if(window.Notification&&Notification.permission==='default'){{try{{Notification.requestPermission();}}catch(_){{}}}}
+if(window.Notification&&window.Notification.permission==='default'){{try{{window.Notification.requestPermission();}}catch(_){{}}}}
 pollBridge();loadInterval();setInterval(pollBridge,30000);
 // ---- task view/edit/delete modal ----
 var _tStatus=['todo','in-progress','blocked','review','done'];
@@ -1850,7 +1850,7 @@ function _showTaskView(t, archived){{
   var mark=isDone?'✅ ':'☐ ';
   var acc=(t.acceptance||[]).map(function(a){{return '<li style="list-style:none;margin-left:-18px">'+mark+_esc(a)+'</li>';}}).join('')||'<li class=smeta>—</li>';
   var ro=archived?' <span class="bstage" style="background:#6b7280">read-only</span>':'';
-  var rpt=t.report?('<label style="margin-top:12px;font-size:12px;color:#94a3b8">Laporan Hasil (DoD / Evidence)</label><div class="brow" style="margin-top:4px"><button type="button" class="btn n" style="display:inline-flex;align-items:center;gap:6px;border-color:#38bdf8;color:#38bdf8;cursor:pointer;padding:6px 12px;border-radius:8px;background:rgba(56,189,248,0.08)" onclick="_showReportFromTask(\''+_esc(t.report)+'\')">📄 <b>'+_esc(t.report)+'</b> <span style="font-size:11px;opacity:0.85;margin-left:4px">Buka Laporan →</span></button></div>'):'';
+  var rpt=t.report?('<label style="margin-top:12px;font-size:12px;color:#94a3b8">Laporan Hasil (DoD / Evidence)</label><div class="brow" style="margin-top:4px"><button type="button" class="btn n" style="display:inline-flex;align-items:center;gap:6px;border-color:#38bdf8;color:#38bdf8;cursor:pointer;padding:6px 12px;border-radius:8px;background:rgba(56,189,248,0.08)" data-rpt="'+_esc(t.report)+'" onclick="_showReportFromTask(this.dataset.rpt)">📄 <b>'+_esc(t.report)+'</b> <span style="font-size:11px;opacity:0.85;margin-left:4px">Buka Laporan →</span></button></div>'):'';
   var html=''
     +'<div class="brow" style="margin-bottom:10px">'
     +'<span class="bstage s-tasks">'+_esc(t.id)+'</span>'

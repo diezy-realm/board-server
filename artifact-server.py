@@ -505,9 +505,18 @@ def read_artifact(src, aid):
                 "raw": cp.read_text(encoding="utf-8", errors="replace")}
     else:
         f = DOCS_DIR / aid
-        if ".." in aid or not f.is_file(): return None
-        return {"name": f.stem, "kind": "md" if f.suffix.lower()==".md" else "widget",
-                "raw": f.read_text(encoding="utf-8", errors="replace")}
+        if ".." in aid: return None
+        if f.is_file():
+            return {"name": f.stem, "kind": "md" if f.suffix.lower()==".md" else "widget",
+                    "raw": f.read_text(encoding="utf-8", errors="replace")}
+        # Fallback: jika aid adalah dokumen board (misal RPT-069, RPT-069.md, SPEC-xxx)
+        stem = re.sub(r"\.md$", "", aid)
+        if BOARD_DIR.is_dir():
+            for cand in BOARD_DIR.rglob(f"{stem}.md"):
+                if cand.is_file():
+                    return {"name": cand.stem, "kind": "md",
+                            "raw": cand.read_text(encoding="utf-8", errors="replace")}
+        return None
 
 # ----- write ops (each returns (ok, msg)) -----
 _ID_RE = re.compile(r"^[0-9a-zA-Z][0-9a-zA-Z._-]*$")
@@ -1379,9 +1388,34 @@ BOARD_EXTRA_CSS = """
 .bchip.bchip-ro{background:#18192c;color:#94a3b8;border-color:#282a44}
 """
 
+def auto_archive_done_sprints():
+    """Otomatis memindahkan folder sprint yang berstatus done/closed dari sprints/ ke archive/."""
+    sprints_dir = BOARD_DIR / "sprints"
+    archive_dir = BOARD_DIR / "archive"
+    if not sprints_dir.is_dir():
+        return
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    for sd in list(sprints_dir.glob("sprint-*")):
+        if not sd.is_dir():
+            continue
+        sp = sd / "SPRINT.md"
+        if not sp.is_file():
+            continue
+        try:
+            fm = _board_fm(sp.read_text(encoding="utf-8", errors="replace"))
+            s_status = (fm.get("status") or "").lower()
+            if s_status in ("done", "closed"):
+                dest = archive_dir / sd.name
+                if not dest.exists():
+                    shutil.move(str(sd), str(dest))
+        except Exception:
+            pass
+
+
 def load_board():
     """Scan ~/Apps/board -> list of items with stage, status, sprint, assignee.
     Reads disk every call (auto-load, no cache), same contract as artifacts."""
+    auto_archive_done_sprints()
     items, sprints = [], {}
     if not BOARD_DIR.is_dir():
         return items, sprints
@@ -1677,7 +1711,7 @@ function loadEvents(){{fetch('/api/bridge/events').then(function(r){{return r.js
   if(!ev.length){{el.innerHTML='<div style="padding:14px;color:#9ca3af;font-size:13px">Belum ada event.</div>';return;}}
   el.innerHTML=ev.map(function(e){{
     var when=(e.ts||'').replace('T',' ').slice(0,16);
-    var rpt=e.report?(' · <a href="/view/doc/'+encodeURIComponent(e.report)+'" style="color:#93c5fd" target="_blank">'+e.report+'</a>'):'';
+    var rpt=e.report?(' · <a href="javascript:void(0)" onclick="_showReportView(\''+encodeURIComponent(e.report)+'\')" style="color:#93c5fd">'+e.report+'</a>'):'';
     return '<div style="padding:8px 10px;border-bottom:1px solid #1f2937">'+
       '<div style="font-size:13px">'+_ico(e.kind)+' <b>'+(e.task_id||'')+'</b> '+(e.title||'').replace(/</g,'&lt;')+'</div>'+
       '<div style="font-size:11px;color:#9ca3af">'+when+' · '+e.kind+rpt+'</div></div>';}}).join('');}})
@@ -1749,6 +1783,40 @@ function _showReportView(id){{
     _bmodal('Report '+id+' (view-only)', html);
   }}).catch(function(){{_bmodal('Report '+id, '<p class=smeta style="padding:20px">Gagal memuat report.</p>');}});
 }}
+function _showReportFromTask(id){{
+  _bmodal('Laporan '+id, '<div class="smeta" style="padding:28px 12px;text-align:center">Memuat dokumen '+_esc(id)+'…</div>');
+  fetch('/api/board/report?id='+encodeURIComponent(id)).then(function(r){{return r.json();}}).then(function(d){{
+    if(!d.ok){{
+      var errHtml='<div style="padding:16px;color:#f87171">'+_esc(d.msg||'Report tidak ditemukan.')+'</div>'
+        +'<div class="modal-actions" style="margin-top:14px"><button type="button" class="btn n" onclick="_backToTask()">← Kembali ke Task</button>'
+        +'<button type="button" class="btn n" onclick="closeBModal()">Tutup</button></div>';
+      _bmodal('Laporan '+id, errHtml);
+      return;
+    }}
+    var html='<div class="rpt-modal-view" style="max-height:60vh;overflow-y:auto;padding:8px 4px 16px;font-size:13.5px;line-height:1.6;color:#e2e8f0;border-bottom:1px solid #282a48">'
+      +d.html
+      +'</div>'
+      +'<div class="modal-actions" style="display:flex;justify-content:space-between;align-items:center;margin-top:14px">'
+      +'<button type="button" class="btn n" style="display:inline-flex;align-items:center;gap:6px;border-color:#38bdf8;color:#38bdf8" onclick="_backToTask()">'
+      +'← Kembali ke Task'
+      +'</button>'
+      +'<button type="button" class="btn n" onclick="closeBModal()">Tutup</button>'
+      +'</div>';
+    _bmodal('Laporan '+id+' (Hasil Pelaksanaan)', html);
+  }}).catch(function(){{
+    var errHtml='<div style="padding:16px;color:#f87171">Gagal memuat report dari server.</div>'
+      +'<div class="modal-actions" style="margin-top:14px"><button type="button" class="btn n" onclick="_backToTask()">← Kembali ke Task</button>'
+      +'<button type="button" class="btn n" onclick="closeBModal()">Tutup</button></div>';
+    _bmodal('Laporan '+id, errHtml);
+  }});
+}}
+function _backToTask(){{
+  if(window._curTask){{
+    _showTaskView(window._curTask, window._curTaskArchived);
+  }} else {{
+    closeBModal();
+  }}
+}}
 function _bmodal(title,html){{
   var m=document.getElementById('bmodal');
   if(!m){{m=document.createElement('div');m.id='bmodal';m.className='modal';m.innerHTML='<div class="modal-box"><h3 id="bmt"></h3><div id="bmb"></div></div>';document.body.appendChild(m);
@@ -1757,11 +1825,13 @@ function _bmodal(title,html){{
 }}
 function closeBModal(){{var m=document.getElementById('bmodal');if(m)m.classList.remove('open');}}
 function _showTaskView(t, archived){{
+  window._curTask=t;
+  window._curTaskArchived=archived;
   var isDone=(t.status||'').toLowerCase()==='done';
   var mark=isDone?'✅ ':'☐ ';
   var acc=(t.acceptance||[]).map(function(a){{return '<li style="list-style:none;margin-left:-18px">'+mark+_esc(a)+'</li>';}}).join('')||'<li class=smeta>—</li>';
   var ro=archived?' <span class="bstage" style="background:#6b7280">read-only</span>':'';
-  var rpt=t.report?('<label>Report / DoD</label><div class="brow"><a class="btn n" href="/view/doc/'+encodeURIComponent(t.report)+'" target="_blank">📄 '+_esc(t.report)+'</a></div>'):'';
+  var rpt=t.report?('<label style="margin-top:12px;font-size:12px;color:#94a3b8">Laporan Hasil (DoD / Evidence)</label><div class="brow" style="margin-top:4px"><button type="button" class="btn n" style="display:inline-flex;align-items:center;gap:6px;border-color:#38bdf8;color:#38bdf8;cursor:pointer;padding:6px 12px;border-radius:8px;background:rgba(56,189,248,0.08)" onclick="_showReportFromTask(\''+_esc(t.report)+'\')">📄 <b>'+_esc(t.report)+'</b> <span style="font-size:11px;opacity:0.85;margin-left:4px">Buka Laporan →</span></button></div>'):'';
   var html=''
     +'<div class="brow" style="margin-bottom:10px">'
     +'<span class="bstage s-tasks">'+_esc(t.id)+'</span>'
@@ -1776,7 +1846,6 @@ function _showTaskView(t, archived){{
       +'<button class="btn" style="background:#dc2626;color:#fff" onclick="_delTask('+"'"+_esc(t.id)+"'"+')">🗑 Hapus</button>')
     +'<button class="btn n" onclick="closeBModal()">Tutup</button></div>';
   _bmodal('Task '+t.id+(archived?' (view-only)':''), html);
-  window._curTask=t;
 }}
 function _editTask(id){{
   var t=window._curTask;if(!t)return;

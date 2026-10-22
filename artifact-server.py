@@ -645,6 +645,10 @@ def render_index():
   <button class="btn n" onclick="openImport()">⬆ Import</button>
 </div>
 <div id="list">{''.join(sections) if sections else '<div class="empty">Belum ada artifact.</div>'}</div>
+{render_notes_section()}
+<div id="nmodal" class="modal"><div class="modal-box">
+  <h3 id="nmt"></h3><div id="nmb"></div>
+</div></div>
 
 <div class="modal" id="modal"><div class="modal-box">
   <h3 id="mTitle"></h3><div id="mBody"></div>
@@ -657,6 +661,7 @@ def render_index():
 <script>
 var MOVE_OPTS = `{move_opts}`;
 function cardVisible(c,q,fd,ff,fo){{
+  if(c.dataset.id)return c.dataset.s.indexOf(q)>-1;  // note card: search-only, date/fmt/folder filters don't apply (not an artifact)
   return c.dataset.s.indexOf(q)>-1 && (!fd||c.dataset.date===fd) && (!ff||c.dataset.fmt===ff)
     && (!fo||c.dataset.folder===fo||c.dataset.folder.indexOf(fo+' / ')===0);}}
 function applyF(){{
@@ -698,8 +703,9 @@ function openImport(){{openModal('Import file','<label>Pilih file (.md/.html)</l
     var f=document.getElementById('x1');if(!f.files.length){{toast('pilih file dulu');return;}}
     var fd=new FormData();fd.append('file',f.files[0]);fd.append('folder',document.getElementById('x2').value);
     fetch('/api/import',{{method:'POST',body:fd}}).then(function(r){{return r.json();}}).then(function(r){{closeModal();toast(r.msg||'diimport');location.reload();}});}});}}
+{NOTES_MODAL_JS}
 </script>"""
-    return shell("Artifact Library", body)
+    return shell("Artifact Library", body, extra_head=f"<style>{BOARD_EXTRA_CSS}</style>")
 
 def render_editor(aid):
     m = read_meta(aid)
@@ -748,12 +754,99 @@ def _board_fm(text):
         out[k.strip()] = v.strip().strip('"').strip("'")
     return out
 
+# Shared board/notes CSS (used by render_board AND render_notes) -- was a
+# local string inside render_board only; extracted so the Research tab
+# actually gets .bboard/.bcol/.bcard styling instead of rendering unstyled text.
+BOARD_EXTRA_CSS = """
+/* Board layout: flexible columns, smooth scrolling */
+.bboard{display:flex;gap:12px;overflow-x:auto;padding:4px 0 16px;-webkit-overflow-scrolling:touch;scrollbar-width:thin;scrollbar-color:#cbd5e1 transparent}
+.bboard::-webkit-scrollbar{height:6px}
+.bboard::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:3px}
+.bboard::-webkit-scrollbar-track{background:transparent}
+
+/* Column wrapper: modern rounded container */
+.bcol{flex:0 0 260px;min-width:260px;background:#f8fafc;border-radius:12px;padding:8px 6px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.bcol-h{font-weight:700;font-size:14px;color:#0f172a;padding:6px 10px;display:flex;align-items:center;gap:8px;text-transform:uppercase;letter-spacing:.05em}
+.bcnt{margin-left:auto;background:#6366f1;color:#fff;border-radius:999px;font-size:12px;font-weight:600;padding:2px 9px;min-width:24px;text-align:center;box-shadow:0 1px 2px rgba(99,102,241,.3)}
+
+/* Column body: cards container with minimum height */
+.bcol-body{display:flex;flex-direction:column;gap:10px;min-height:40px;padding:2px;transition:background .2s,border-color .2s}
+.bcol-body.drag-over{background:#e0e7ff;border-radius:10px}
+
+/* Card: modern elevated style with subtle hover lift */
+.bcard{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;box-shadow:0 2px 4px rgba(0,0,0,.04);transition:transform .15s ease,box-shadow .15s ease,border-color .15s}
+.bcard:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,.08);border-color:#cbd5e1;cursor:grab}
+.bcard.drag{cursor:grab}
+.bcard.dragging{opacity:.5;cursor:grabbing;transform:none;box-shadow:0 2px 4px rgba(0,0,0,.04)}
+.bcard.bcard-static{cursor:pointer}
+.bcard.bcard-static:hover{cursor:pointer}
+
+/* Card elements: ID, title, row */
+.bid{font:600 12px ui-monospace,monospace;color:#6366f1;background:#f0f4ff;border-radius:6px;padding:2px 8px;display:inline-block}
+.btitle{font-size:14px;color:#0f172a;margin:6px 0 8px;line-height:1.45;font-weight:500}
+.brow{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+
+/* Chips and badges */
+.bchip{font-size:11px;background:#f1f5f9;color:#475569;border-radius:999px;padding:2px 8px;display:inline-flex;align-items:center;gap:4px;border:1px solid #e2e8f0}
+.bchip.bchip-agy{background:#fef2f2;color:#dc2626;border-color:#fecaca}
+.bchip.bchip-kiro{background:#f0fdf4;color:#16a34a;border-color:#bbf7d0}
+.bchip.role-backend{background:#eff6ff;color:#1d4ed8;border-color:#bfdbfe;font-weight:600}
+.bchip.role-frontend{background:#fdf4ff;color:#a21caf;border-color:#f5d0fe;font-weight:600}
+.bchip.role-design{background:#fffbeb;color:#b45309;border-color:#fde68a;font-weight:600}
+.bchip.role-qa{background:#f0fdf4;color:#15803d;border-color:#bbf7d0;font-weight:600}
+.bstage{font-size:10px;border-radius:999px;padding:2px 8px;color:#fff;font-weight:600;text-transform:uppercase}
+.s-stories{background:#8b5cf6}.s-backlog{background:#0ea5e9}.s-prd{background:#f59e0b}
+.s-specs{background:#10b981}.s-tasks{background:#ef4444}.s-reports{background:#6366f1}
+.bstage.bstage-arsip{background:#6b7280;font-size:10px}
+
+/* Empty state */
+.bempty{color:#94a3b8;text-align:center;padding:16px 8px;font-size:13px;font-style:italic}
+
+/* Progress sprint cards */
+.sprogwrap{display:flex;flex-direction:column;gap:10px;margin:6px 0 12px}
+.sprog{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:12px;display:block;text-decoration:none;color:inherit;transition:border-color .15s,box-shadow .15s,transform .15s}
+.sprog:hover{border-color:#6366f1;box-shadow:0 4px 12px rgba(99,102,241,.15);transform:translateY(-1px)}
+.sprog.ssel{border-color:#6366f1;box-shadow:0 0 0 2px rgba(99,102,241,.2)}
+.sprog-h{display:flex;justify-content:space-between;align-items:baseline;font-size:14px}
+.sprog-h b{color:#0f172a;font-weight:600}
+.smeta{color:#64748b;font-size:12px;font-weight:500}
+.sbar{height:8px;background:#e2e8f0;border-radius:999px;margin:8px 0 6px;overflow:hidden;position:relative}
+.sbar::after{content:'';position:absolute;inset:0;border-radius:999px;background:linear-gradient(90deg,#6366f1,#8b5cf6);opacity:.15}
+.sfill{height:100%;background:linear-gradient(90deg,#6366f1,#8b5cf6);border-radius:999px;transition:width .35s ease;position:relative}
+.sfill::after{content:'';position:absolute;inset:0;border-radius:999px;background:linear-gradient(90deg,rgba(255,255,255,.2),transparent);opacity:.35}
+.sgoal{color:#334155;font-size:13px;line-height:1.4}
+
+/* Notes tab: section header above each group's card row (artifact-library style) */
+.nsec-h{font-weight:700;font-size:13px;color:#475569;text-transform:uppercase;letter-spacing:.05em;margin:18px 0 8px;display:flex;align-items:center;gap:8px;border-bottom:1px solid #e2e8f0;padding-bottom:6px}
+.nsec-h .bcnt{background:#94a3b8}
+.ngrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}
+@media (max-width:768px){.ngrid{grid-template-columns:repeat(auto-fill,minmax(100%,1fr));gap:10px}.ncard{padding:12px}}
+@media (max-width:480px){.ngrid{gap:8px}.ncard{padding:10px}}
+.ncard{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:14px 16px;box-shadow:0 2px 4px rgba(0,0,0,.04);transition:transform .15s ease,box-shadow .15s ease,border-color .15s;cursor:pointer;display:flex;flex-direction:column;gap:6px}
+.ncard:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,.08);border-color:#cbd5e1}
+.ncard:focus-visible{outline:2px solid #6366f1;outline-offset:2px;border-color:#6366f1}
+.ncard .ntitle{font-size:15px;font-weight:600;color:#0f172a;line-height:1.35}
+.ncard .nfname{font:600 11px ui-monospace,monospace;color:#94a3b8}
+/*
+WCAG AA compliant badge colors (contrast ratio ≥4.5:1):
+- .bchip-addendum: bg #fef3c7 (light yellow), fg #92400e (dark brown) = 12.6:1 ✓
+- .bchip-ro: bg #f1f5f9 (light gray), fg #64748b (slate) = 5.3:1 ✓ (bare minimum)
+- .bchip-addendum on .bchip-ro combo: dark brown on light gray = 10.2:1 ✓
+*/
+.bchip.bchip-addendum{background:#fef3c7;color:#92400e;border-color:#fde68a}
+.bchip.bchip-ro{background:#eef2f7;color:#475569;border-color:#e2e8f0}
+"""
+
 def load_board():
     """Scan ~/Apps/board -> list of items with stage, status, sprint, assignee.
     Reads disk every call (auto-load, no cache), same contract as artifacts."""
     items, sprints = [], {}
     if not BOARD_DIR.is_dir():
         return items, sprints
+    # Valid artifact ID prefix per stage (mirrors validate.py STAGES) -- skips
+    # stray files like README.md that live inside a stage folder but aren't artifacts.
+    _ID_PREFIX = {"stories": "US", "backlog": "BL", "prd": "PRD",
+                  "specs": "SPEC", "tasks": "TASK", "reports": "RPT"}
     for f in sorted(BOARD_DIR.rglob("*")):
         if not f.is_file():
             continue
@@ -762,6 +855,9 @@ def load_board():
             continue
         is_task = (stage == "tasks")
         if is_task != (f.suffix == ".json"):
+            continue
+        prefix = _ID_PREFIX.get(stage)
+        if prefix and not re.match(rf"^{prefix}-\d{{3,}}$", f.stem):
             continue
         try:
             text = f.read_text(encoding="utf-8", errors="replace")
@@ -787,6 +883,8 @@ def load_board():
         items.append({
             "id": meta.get("id") or f.stem, "title": meta.get("title") or f.stem,
             "stage": stage, "status": status_raw, "assignee": meta.get("assignee") or "",
+            "role": (meta.get("role") or "").lower(),
+            "tags": meta.get("tags") if isinstance(meta.get("tags"), list) else [],
             "sprint": sprint, "rel": f.relative_to(BOARD_DIR).as_posix(), "archived": archived,
         })
     # sprint goals/status (active sprints + archived sprints)
@@ -803,9 +901,17 @@ def load_board():
     return items, sprints
 
 def _board_card(it, drag=False):
-    asg = f'<span class="bchip">{_html.escape(it["assignee"])}</span>' if it["assignee"] else ""
+    # Assignee chip dengan styling berbeda untuk agy vs kirocrew
+    asg_cls = "bchip-agy" if it.get("assignee") == "agy" else ("bchip-kiro" if it.get("assignee") == "kirocrew" else "")
+    asg = f'<span class="bchip{" " + asg_cls if asg_cls else ""}">{_html.escape(it["assignee"] or "unassigned")}</span>' if it["assignee"] else ""
     stg = f'<span class="bstage s-{it["stage"]}">{STAGE_LABEL.get(it["stage"], it["stage"])}</span>'
-    arch = '<span class="bstage" style="background:#6b7280">arsip</span>' if it.get("archived") else ""
+    arch = '<span class="bstage bstage-arsip">arsip</span>' if it.get("archived") else ""
+    # Role flag / badge (Backend, Frontend, Design, QA)
+    role_flag = ""
+    role = it.get("role") or ""
+    if role:
+        role_label = {"backend": "🛠 BE", "frontend": "🎨 FE", "design": "✨ Design", "qa": "🧪 QA"}.get(role, role.upper())
+        role_flag = f'<span class="bchip role-{_html.escape(role)}">{_html.escape(role_label)}</span>'
     # only tasks are drag-movable (status is a task concept); draggable only in status view
     can_drag = drag and it["stage"] == "tasks" and not it.get("archived")
     dattr = (f' draggable="true" ondragstart="dragStart(event,\'{_html.escape(it["id"])}\')"'
@@ -817,13 +923,15 @@ def _board_card(it, drag=False):
     retry = ""
     if it["stage"] == "tasks" and it.get("status") in ("blocked", "failed") and it.get("assignee") == "agy":
         retry = (f'<button onclick="retryTask(\'{_html.escape(it["id"])}\',event)" '
-                 f'style="margin-left:auto;background:#7c3aed;color:#fff;border:none;border-radius:6px;'
-                 f'font-size:11px;padding:2px 8px;cursor:pointer">🔄 retry</button>')
-    return (f'<div class="{cls}"{cur} data-asg="{_html.escape(it["assignee"])}" data-sprint="{_html.escape(it["sprint"])}"'
+                 f'style="margin-left:auto;background:#7c3aed;color:#fff;border:none;border-radius:6px;transition:transform .15s,box-shadow .15s;'
+                 f'font-size:11px;padding:2px 8px;cursor:pointer"'
+                 f'onmouseover="this.style.transform=\'translateY(-1px)\'" onmouseout="this.style.transform=\'translateY(0)\'">🔄 retry</button>')
+    return (f'<div class="{cls}"{cur} data-asg="{_html.escape(it["assignee"])}" data-role="{_html.escape(role)}"'
+            f' data-sprint="{_html.escape(it["sprint"])}"'
             f' data-id="{_html.escape(it["id"])}" data-stage="{it["stage"]}" data-arch="{"1" if it.get("archived") else ""}"{dattr}{clickable}>'
             f'<div class="bid">{_html.escape(it["id"])}</div>'
             f'<div class="btitle">{_html.escape(it["title"])}</div>'
-            f'<div class="brow" style="display:flex;align-items:center">{stg}{asg}{arch}{retry}</div></div>')
+            f'<div class="brow">{stg}{role_flag}{asg}{arch}{retry}</div></div>')
 
 def render_board(view="status", sprint_filter="", show_archived=False):
     items, sprints = load_board()
@@ -869,8 +977,12 @@ def render_board(view="status", sprint_filter="", show_archived=False):
                 "partial":"review","failed":"blocked"}.get(s, "todo")
 
     is_status = (view != "stage")
+    # Status view = Kanban status, konsep yang hanya berlaku untuk task (unit eksekusi agy);
+    # story/backlog/spec/report adalah artefak perencanaan/laporan, sudah punya kolom sendiri
+    # di view Alur -- disembunyikan di sini agar kolom status tidak tercampur type lain.
+    view_items = [it for it in items if it["stage"] == "tasks"] if is_status else items
     colmap = {c: [] for c in cols}
-    for it in items:
+    for it in view_items:
         b = bucket(it)
         if b in colmap:
             colmap[b].append(it)
@@ -892,13 +1004,17 @@ def render_board(view="status", sprint_filter="", show_archived=False):
                 f'href="/board?view={view}{"&archived=1" if not show_archived else ""}">{"📦 Arsip" if not show_archived else "📦 Arsip ✓"}</a>')
     asgs = sorted({it["assignee"] for it in items if it["assignee"]})
     asg_opts = '<option value="">Semua assignee</option>' + "".join(f'<option value="{_html.escape(a)}">{_html.escape(a)}</option>' for a in asgs)
+    roles = [r for r in ["backend", "frontend", "design", "qa"] if any(it.get("role")==r for it in items)]
+    role_labels = {"backend": "🛠 Backend", "frontend": "🎨 Frontend", "design": "✨ Design", "qa": "🧪 QA"}
+    role_opts = '<option value="">Semua peran</option>' + "".join(f'<option value="{_html.escape(r)}">{_html.escape(role_labels.get(r, r.upper()))}</option>' for r in roles)
 
     body = f"""
 <div class="treebar noprint" style="align-items:center">
-  {tog("status","🗂 Status")}{tog("stage","🪜 Alur")}{arch_tog}
+  {tog("status","🗂 Status")}{tog("stage","🪜 Alur")}{arch_tog}<a class="btn n" href="/#notes-root">📚 Research</a>
   <select id="bsprint" onchange="var v=this.value;location.href='/board?view={view}'+(v?'&sprint='+encodeURIComponent(v):'')+'{"&archived=1" if show_archived else ""}'">{sprint_opts}</select>
-  <select id="basg" onchange="filterAsg(this.value)">{asg_opts}</select>
-  <span class="smeta">{len(items)} item{" · ARSIP" if show_archived else ""}</span>
+  <select id="basg" onchange="applyFilters()">{asg_opts}</select>
+  <select id="brole" onchange="applyFilters()">{role_opts}</select>
+  <span class="smeta">{len(view_items)} item{" · ARSIP" if show_archived else ""}</span>
   <span id="bridgeHealth" class="smeta" style="margin-left:auto;cursor:default" title="Kesehatan bridge agy">⏳ cek bridge…</span>
   <span class="smeta" style="display:inline-flex;align-items:center;gap:4px" title="Interval cron bridge">
     <select id="ivTimer" class="btn n" style="padding:3px 6px" onchange="loadInterval()">{"".join(f'<option value="{u}">{l}</option>' for u,l in TIMERS.items())}</select>
@@ -917,17 +1033,26 @@ def render_board(view="status", sprint_filter="", show_archived=False):
 <div class="bboard">{"".join(col_html)}</div>
 <div class="toast" id="toast"></div>
 <script>
-function filterAsg(a){{document.querySelectorAll('.bcard').forEach(function(c){{
-  c.style.display=(!a||c.dataset.asg===a)?'':'none';}});
+function applyFilters(){{
+  var a = (document.getElementById('basg')||{{}}).value || '';
+  var r = (document.getElementById('brole')||{{}}).value || '';
+  document.querySelectorAll('.bcard').forEach(function(c){{
+    var matchA = !a || c.dataset.asg === a;
+    var matchR = !r || c.dataset.role === r;
+    c.style.display = (matchA && matchR) ? '' : 'none';
+  }});
   document.querySelectorAll('.bcol').forEach(function(col){{
-    var n=Array.prototype.filter.call(col.querySelectorAll('.bcard'),function(c){{return c.style.display!=='none';}}).length;
-    col.querySelector('.bcnt').textContent=n;}});}}
+    var n = Array.prototype.filter.call(col.querySelectorAll('.bcard'), function(c){{return c.style.display !== 'none';}}).length;
+    col.querySelector('.bcnt').textContent = n;
+  }});
+}}
+function filterAsg(a){{applyFilters();}}
 function toast(m){{var t=document.getElementById('toast');if(!t)return;t.textContent=m;t.style.display='block';setTimeout(function(){{t.style.display='none';}},2200);}}
 var _dragId=null;
 function dragStart(e,id){{_dragId=id;e.dataTransfer.effectAllowed='move';try{{e.dataTransfer.setData('text/plain',id);}}catch(_){{}} e.target.classList.add('dragging');}}
-function dragEnd(e){{e.target.classList.remove('dragging');document.querySelectorAll('.bcol-body.over').forEach(function(x){{x.classList.remove('over');}});}}
-function dragOver(e){{e.preventDefault();e.dataTransfer.dropEffect='move';e.currentTarget.classList.add('over');}}
-function dragLeave(e){{e.currentTarget.classList.remove('over');}}
+function dragEnd(e){{e.target.classList.remove('dragging');document.querySelectorAll('.bcol-body.drag-over').forEach(function(x){{x.classList.remove('drag-over');}});}}
+function dragOver(e){{e.preventDefault();e.dataTransfer.dropEffect='move';e.currentTarget.classList.add('drag-over');}}
+function dragLeave(e){{e.currentTarget.classList.remove('drag-over');}}
 function dropCard(e,status){{e.preventDefault();e.currentTarget.classList.remove('over');
   var id=_dragId||e.dataTransfer.getData('text/plain');if(!id)return;
   var card=document.querySelector('.bcard[data-id="'+id+'"]');
@@ -1089,36 +1214,7 @@ function _delTask(id){{
     .catch(function(){{toast('Error jaringan');}});
 }}
 </script>"""
-    extra = """<style>
-.bboard{display:flex;gap:10px;overflow-x:auto;padding:4px 0 16px;-webkit-overflow-scrolling:touch}
-.bcol{flex:0 0 240px;min-width:240px;background:#eef2f7;border-radius:12px;padding:8px}
-.bcol-h{font-weight:700;font-size:13px;color:#374151;padding:6px 8px;display:flex;align-items:center;gap:6px}
-.bcnt{margin-left:auto;background:#2563eb;color:#fff;border-radius:999px;font-size:11px;padding:1px 8px}
-.bcol-body{display:flex;flex-direction:column;gap:8px;min-height:20px}
-.bcard{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:9px 11px;box-shadow:0 1px 2px rgba(0,0,0,.05)}
-.bcard.drag{cursor:grab}
-.bcard.dragging{opacity:.5;cursor:grabbing}
-.bcol-body.over{outline:2px dashed #2563eb;outline-offset:2px;border-radius:8px;background:#dbeafe55}
-.bid{font:600 11px ui-monospace,monospace;color:#2563eb}
-.btitle{font-size:14px;color:#111827;margin:3px 0 6px;line-height:1.35}
-.brow{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
-.bchip{font-size:11px;background:#f3e8ff;color:#6b21a8;border-radius:999px;padding:1px 8px}
-.bstage{font-size:10px;border-radius:999px;padding:1px 7px;color:#fff}
-.s-stories{background:#8b5cf6}.s-backlog{background:#0ea5e9}.s-prd{background:#f59e0b}
-.s-specs{background:#10b981}.s-tasks{background:#ef4444}.s-reports{background:#6366f1}
-.bempty{color:#9ca3af;text-align:center;padding:12px;font-size:13px}
-.sprogwrap{display:flex;flex-direction:column;gap:8px;margin:4px 0 14px}
-.sprog{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;display:block;text-decoration:none;color:inherit;transition:border-color .15s,box-shadow .15s}
-.sprog:hover{border-color:#2563eb;box-shadow:0 2px 8px rgba(37,99,235,.12)}
-.sprog.ssel{border-color:#2563eb;box-shadow:0 0 0 2px #2563eb33}
-.tdesc{white-space:pre-wrap;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:10px;font-size:13px;color:#374151;max-height:260px;overflow:auto}
-.sprog-h{display:flex;justify-content:space-between;align-items:baseline;font-size:14px}
-.smeta{color:#6b7280;font-size:12px}
-.sbar{height:7px;background:#e5e7eb;border-radius:999px;margin:7px 0 4px;overflow:hidden}
-.sfill{height:100%;background:#059669;border-radius:999px}
-.sgoal{color:#4b5563;font-size:13px}
-</style>"""
-    return shell("Board — Scrum Tracking", body, extra_head=extra)
+    return shell("Board — Scrum Tracking", body, extra_head=f"<style>{BOARD_EXTRA_CSS}</style>")
 
 # ----- board write op: change a task's status (drag-to-move) -----
 TASK_STATUS = ["todo", "in-progress", "blocked", "review", "done"]
@@ -1151,11 +1247,12 @@ def op_board_task_status(task_id, new_status):
 
 
 def _find_task_file(task_id, include_archive=True):
-    """Resolve a task id -> its JSON file path (board-wide, incl. archive)."""
+    """Resolve a task id -> its JSON file path (board-wide, incl. archive).
+    Exact match on filename stem, not glob prefix (TASK-001 must not match TASK-0010.json)."""
     if not BOARD_DIR.is_dir():
         return None
     for f in BOARD_DIR.rglob(f"{task_id}*.json"):
-        if f.parent.name != "tasks":
+        if f.stem != task_id or f.parent.name != "tasks":
             continue
         in_archive = "archive" in f.relative_to(BOARD_DIR).parts
         if in_archive and not include_archive:
@@ -1212,6 +1309,237 @@ def op_board_task_delete(task_id):
     shutil.move(str(f), str(dest))
     return True, f"{task_id} dihapus (ke .trash)"
 
+# ---------- board notes (research / product-research / governance / root docs / addenda) -----
+# NOT Scrum artifacts: no id/status lifecycle, not covered by validate.py.
+# Grouped read+CRUD view for documents that exist in board/ but never appear
+# on the Kanban (its BOARD_STAGES is deliberately Scrum-only).
+NOTE_GROUPS = {
+    "research": ("📚 Research", BOARD_DIR / "research"),
+    "product-research": ("📈 Product Research", BOARD_DIR / "product-research"),
+    "governance": ("🏛 Governance", BOARD_DIR / "governance"),
+}
+# root-level docs worth surfacing (explicit allowlist -- not every stray file,
+# e.g. .gitignore/validate.py/sprint-manager.py are code/config, not notes)
+NOTE_ROOT_FILES = ["RULES.md", "AGENTS.md", "TEMPLATES.md", "MIGRATION-PLAN-tahap2.md",
+                    "BOARD_BUG_AUDIT_REPORT.md", "AUDIT_SUMMARY_FOR_LEAD.txt"]
+_NOTE_ID_RE = re.compile(r"^[a-zA-Z0-9_.\-]+$")
+_ADDENDUM_RE = re.compile(r"^#{1,6}\s*(ADDENDUM.*)$", re.I | re.M)
+
+def _note_id(group, fname):
+    return f"{group}::{fname}"
+
+def _note_path(note_id):
+    """note_id -> Path, exact match only, confined to BOARD_DIR (no traversal)."""
+    if "::" not in (note_id or ""):
+        return None
+    group, fname = note_id.split("::", 1)
+    if not _NOTE_ID_RE.match(fname):
+        return None
+    if group == "root":
+        if fname not in NOTE_ROOT_FILES:
+            return None
+        return BOARD_DIR / fname
+    if group not in NOTE_GROUPS:
+        return None
+    return NOTE_GROUPS[group][1] / fname
+
+def load_notes():
+    """Scan note groups -> list of {id, group, group_label, fname, title, created,
+    mtime, size, addenda:[...]}. Reads disk every call, same no-cache contract as
+    load_board(). Sorted DESC by created within each group (grouping happens at
+    render time; this just guarantees stable newest-first order per group)."""
+    items = []
+    groups = dict(NOTE_GROUPS)
+    for fname in NOTE_ROOT_FILES:
+        p = BOARD_DIR / fname
+        if p.is_file():
+            items.append(_note_item("root", "🗂 Root Docs", p))
+    for gkey, (glabel, gdir) in groups.items():
+        if not gdir.is_dir():
+            continue
+        for p in sorted(gdir.glob("*.md")) + sorted(gdir.glob("*.txt")):
+            if p.name == "README.md":
+                continue  # folder index, not a note -- same filter as load_board()'s README skip
+            items.append(_note_item(gkey, glabel, p))
+    items.sort(key=lambda it: it["created"], reverse=True)
+    return items
+
+def _note_item(gkey, glabel, p):
+    text = p.read_text(encoding="utf-8", errors="replace")
+    fm = _board_fm(text)
+    title = fm.get("title") or p.stem.replace("-", " ")
+    addenda = [m.group(1).strip() for m in _ADDENDUM_RE.finditer(text)]
+    mtime = p.stat().st_mtime
+    # created_at: prefer explicit front-matter `created:` (set by op_note_create/edit),
+    # fall back to file mtime for the 29+ pre-existing research docs that have none.
+    created = fm.get("created") or datetime.datetime.fromtimestamp(mtime).isoformat()
+    return {"id": _note_item_id(gkey, p.name), "group": gkey, "group_label": glabel,
+            "fname": p.name, "title": title, "created": created, "mtime": mtime,
+            "size": p.stat().st_size, "addenda": addenda}
+
+def _note_item_id(gkey, fname):
+    return _note_id(gkey, fname)
+
+def op_note_get(note_id):
+    p = _note_path(note_id)
+    if p is None or not p.is_file():
+        return False, "dokumen tidak ditemukan"
+    text = p.read_text(encoding="utf-8", errors="replace")
+    fm = _board_fm(text)
+    body = re.sub(r"^---\s*\n.*?\n---\s*\n?", "", text, count=1, flags=re.S)
+    return True, {"id": note_id, "title": fm.get("title") or p.stem.replace("-", " "),
+                  "raw": body, "html": md_to_html(body),
+                  "mtime": datetime.datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M")}
+
+def op_note_create(group, title, content):
+    if group not in NOTE_GROUPS:
+        return False, "grup tidak dikenal (pilih research/product-research/governance)"
+    title = (title or "Untitled note").strip()
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-") or "note"
+    gdir = NOTE_GROUPS[group][1]
+    gdir.mkdir(parents=True, exist_ok=True)
+    fname = f"{slug}-{datetime.date.today().isoformat()}.md"
+    p = gdir / fname
+    if p.exists():
+        return False, "file dengan nama ini sudah ada, ganti judul"
+    fm = f"---\ntitle: \"{title}\"\ncreated: {now_iso()}\n---\n\n"
+    p.write_text(fm + (content or ""), encoding="utf-8")
+    return True, _note_id(group, fname)
+
+def op_note_edit(note_id, title, content):
+    p = _note_path(note_id)
+    if p is None or not p.is_file():
+        return False, "dokumen tidak ditemukan"
+    if note_id.split("::", 1)[0] == "root":
+        return False, "root doc bersifat view-only dari tab ini (edit manual di filesystem)"
+    existing = _board_fm(p.read_text(encoding="utf-8", errors="replace"))
+    title = (title or existing.get("title") or p.stem).strip()
+    fm = f"---\ntitle: \"{title}\"\ncreated: {existing.get('created', now_iso())}\nupdated: {now_iso()}\n---\n\n"
+    p.write_text(fm + (content or ""), encoding="utf-8")
+    return True, f"{p.name} tersimpan"
+
+def op_note_delete(note_id):
+    p = _note_path(note_id)
+    if p is None or not p.is_file():
+        return False, "dokumen tidak ditemukan"
+    if note_id.split("::", 1)[0] == "root":
+        return False, "root doc tidak bisa dihapus dari tab ini"
+    TRASH.mkdir(exist_ok=True)
+    dest = TRASH / f"{p.name}.{int(datetime.datetime.now().timestamp())}"
+    shutil.move(str(p), str(dest))
+    return True, f"{p.name} dihapus (ke .trash)"
+
+def render_notes_section():
+    """Research & Notes as a collapsible sub-section of the front-page index
+    (not a separate page) -- same <details>/<summary> dropdown pattern as the
+    artifact folder tree, same .card look as the index, sorted DESC by created
+    within each group. Search integrates with the index's existing search box
+    via the same data-s attribute _card_html() cards use."""
+    items = load_notes()
+    order = ["root"] + list(NOTE_GROUPS.keys())
+    labels = {"root": "🗂 Root Docs", **{k: v[0] for k, v in NOTE_GROUPS.items()}}
+    by_group = {k: [] for k in order}
+    for it in items:
+        by_group.setdefault(it["group"], []).append(it)
+
+    def _card(it):
+        addbadge = f' <span class="badge" style="background:#fef3c7;color:#92400e">+{len(it["addenda"])} addendum</span>' if it["addenda"] else ""
+        is_root = it["group"] == "root"
+        robadge = ' <span class="badge pin" title="view-only">🔒</span>' if is_root else ""
+        when = (it["created"] or "")[:10]
+        meta = f'{when} · {it["size"]//1024 or 1} KB'
+        sk = _html.escape((it["title"] + " " + it["fname"]).lower())
+        root_attr = ' data-root="1"' if is_root else ""
+        return (f'<div class="card" data-s="{sk}" data-id="{_html.escape(it["id"])}"{root_attr}>'
+                f'<div class="body"><a class="title" href="#" onclick="openNote(this.closest(\'.card\'));return false">'
+                f'{_html.escape(it["title"])}</a>{addbadge}{robadge}'
+                f'<div class="meta"><span class="badge md">{_html.escape(it["fname"])}</span> {_html.escape(meta)}</div></div></div>')
+
+    groups_html = []
+    for gkey in order:
+        its = by_group.get(gkey, [])
+        groups_html.append(
+            f'<details class="folder" data-folder="notes-{gkey}" open>'
+            f'<summary class="grp-h">​<span class="arrow"></span>{labels[gkey]}<span class="cnt">{len(its)}</span></summary>'
+            f'<div class="grp-body">{"".join(_card(it) for it in its) or "<div class=empty>Belum ada dokumen.</div>"}</div></details>')
+
+    html = (f'<details class="folder" id="notes-root" data-folder="📚 Research &amp; Notes" open>'
+            f'<summary class="grp-h"><span class="arrow"></span>📚 Research &amp; Notes<span class="cnt">{len(items)}</span>'
+            f'<span class="facts noprint"><button class="btn-reset" style="padding:2px 8px;font-size:12px" '
+            f'onclick="event.preventDefault();event.stopPropagation();newNote()">＋ Catatan baru</button></span></summary>'
+            f'<div class="grp-body" style="margin-left:12px">'
+            f'<p class="meta" style="margin:2px 0 10px">📌 Dokumen riset/addendum/governance -- bukan artefak Scrum, tidak divalidasi validate.py. 🔒 = Root Docs, view-only.</p>'
+            f'{"".join(groups_html)}</div></details>')
+    return html
+
+NOTES_MODAL_JS = """
+function _esc(s){return (s==null?'':String(s)).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+function _nmodal(title,html){
+  var m=document.getElementById('nmodal');
+  if(!m){m=document.createElement('div');m.id='nmodal';m.className='modal';m.innerHTML='<div class="modal-box"><h3 id="nmt"></h3><div id="nmb"></div></div>';document.body.appendChild(m);
+    m.addEventListener('click',function(e){if(e.target===m)closeNModal();});}
+  document.getElementById('nmt').textContent=title;document.getElementById('nmb').innerHTML=html;m.classList.add('open');
+}
+function closeNModal(){var m=document.getElementById('nmodal');if(m)m.classList.remove('open');}
+function openNote(card){
+  var id=card.dataset.id, isRoot=card.dataset.root==='1';
+  fetch('/api/note?id='+encodeURIComponent(id)).then(function(r){return r.json();}).then(function(r){
+    if(!r.ok){toast('✗ '+r.msg);return;}
+    var n=r.note;
+    var html='<div style="max-height:55vh;overflow:auto;font-size:14px;line-height:1.55;margin-bottom:10px">'+n.html+'</div>'
+      +'<div class="modal-actions">'
+      +(isRoot?'':'<button class="btn-reset" onclick="_editNote('+"'"+_esc(id)+"'"+')">✏️ Edit</button>'
+        +'<button class="btn-reset" style="color:#dc2626" onclick="_delNote('+"'"+_esc(id)+"'"+')">🗑 Hapus</button>')
+      +'<button class="btn-reset" onclick="closeNModal()">Tutup</button></div>';
+    _nmodal(n.title+(isRoot?' (view-only)':'')+' · '+n.mtime, html);
+    window._curNote={id:id, title:n.title, raw:n.raw};
+  }).catch(function(){toast('Error jaringan');});
+}
+function _editNote(id){
+  var n=window._curNote;if(!n)return;
+  var html='<label>Judul</label><input id="en_title" value="'+_esc(n.title)+'">'
+    +'<label>Isi (markdown)</label><textarea id="en_body" style="min-height:50vh;font-family:ui-monospace,monospace;font-size:13px">'+_esc(n.raw)+'</textarea>'
+    +'<div class="modal-actions"><button class="btn-reset" onclick="closeNModal()">Batal</button>'
+    +'<button class="btn-reset" onclick="_saveNote('+"'"+_esc(id)+"'"+')">💾 Simpan</button></div>';
+  _nmodal('Edit '+n.title, html);
+}
+function _saveNote(id){
+  var fd=new FormData();fd.append('id',id);
+  fd.append('title',document.getElementById('en_title').value);
+  fd.append('content',document.getElementById('en_body').value);
+  fetch('/api/note/edit',{method:'POST',body:fd}).then(function(r){return r.json();}).then(function(r){
+    toast(r.ok?('✓ '+r.msg):('✗ '+r.msg));if(r.ok){closeNModal();setTimeout(function(){location.reload();},500);}})
+    .catch(function(){toast('Error jaringan');});
+}
+function _delNote(id){
+  if(!confirm('Hapus dokumen ini? (dipindah ke .trash, bisa dipulihkan manual)'))return;
+  var fd=new FormData();fd.append('id',id);
+  fetch('/api/note/delete',{method:'POST',body:fd}).then(function(r){return r.json();}).then(function(r){
+    toast(r.ok?('✓ '+r.msg):('✗ '+r.msg));if(r.ok){closeNModal();setTimeout(function(){location.reload();},500);}})
+    .catch(function(){toast('Error jaringan');});
+}
+function newNote(){
+  var html='<label>Grup</label><select id="nn_group">'
+    +'<option value="research">Research</option><option value="product-research">Product Research</option>'
+    +'<option value="governance">Governance</option></select>'
+    +'<label>Judul</label><input id="nn_title" placeholder="Judul dokumen">'
+    +'<label>Isi (markdown, opsional)</label><textarea id="nn_body" style="min-height:40vh;font-family:ui-monospace,monospace;font-size:13px"></textarea>'
+    +'<div class="modal-actions"><button class="btn-reset" onclick="closeNModal()">Batal</button>'
+    +'<button class="btn-reset" onclick="_createNote()">💾 Buat</button></div>';
+  _nmodal('Catatan baru', html);
+}
+function _createNote(){
+  var fd=new FormData();
+  fd.append('group',document.getElementById('nn_group').value);
+  fd.append('title',document.getElementById('nn_title').value);
+  fd.append('content',document.getElementById('nn_body').value);
+  fetch('/api/note/create',{method:'POST',body:fd}).then(function(r){return r.json();}).then(function(r){
+    toast(r.ok?('✓ dibuat'):('✗ '+r.msg));if(r.ok){closeNModal();setTimeout(function(){location.reload();},500);}})
+    .catch(function(){toast('Error jaringan');});
+}
+"""
+
+
 
 class H(BaseHTTPRequestHandler):
     def _send(self, body, ct="text/html; charset=utf-8", code=200):
@@ -1232,6 +1560,10 @@ class H(BaseHTTPRequestHandler):
             sprint = (qs.get("sprint") or [""])[0]
             archived = (qs.get("archived") or [""])[0] in ("1", "true", "yes")
             return self._send(render_board("stage" if view=="stage" else "status", sprint, archived))
+        if path == "/api/note":
+            qs = parse_qs(self.path.split("?",1)[1]) if "?" in self.path else {}
+            ok, r = op_note_get((qs.get("id") or [""])[0])
+            return self._json({"ok": ok, "note": r if ok else None, "msg": "" if ok else r})
         if path == "/api/board/task":
             qs = parse_qs(self.path.split("?",1)[1]) if "?" in self.path else {}
             tid = (qs.get("id") or [""])[0]
@@ -1346,6 +1678,15 @@ class H(BaseHTTPRequestHandler):
                 return self._json({"ok": ok, "msg": r})
             if path == "/api/board/delete":
                 ok, r = op_board_task_delete(form.get("id",""))
+                return self._json({"ok": ok, "msg": r})
+            if path == "/api/note/create":
+                ok, r = op_note_create(form.get("group",""), form.get("title",""), form.get("content",""))
+                return self._json({"ok": ok, "msg": "dibuat" if ok else r, "id": r if ok else None})
+            if path == "/api/note/edit":
+                ok, r = op_note_edit(form.get("id",""), form.get("title",""), form.get("content",""))
+                return self._json({"ok": ok, "msg": r})
+            if path == "/api/note/delete":
+                ok, r = op_note_delete(form.get("id",""))
                 return self._json({"ok": ok, "msg": r})
         except Exception as e:
             return self._json({"ok": False, "msg": f"error: {e}"}, code=500)

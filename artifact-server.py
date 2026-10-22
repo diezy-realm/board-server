@@ -758,63 +758,548 @@ def _board_fm(text):
 # local string inside render_board only; extracted so the Research tab
 # actually gets .bboard/.bcol/.bcard styling instead of rendering unstyled text.
 BOARD_EXTRA_CSS = """
-/* Board layout: flexible columns, smooth scrolling */
-.bboard{display:flex;gap:12px;overflow-x:auto;padding:4px 0 16px;-webkit-overflow-scrolling:touch;scrollbar-width:thin;scrollbar-color:#cbd5e1 transparent}
-.bboard::-webkit-scrollbar{height:6px}
-.bboard::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:3px}
-.bboard::-webkit-scrollbar-track{background:transparent}
+/* Container expansion for Board: full responsive desktop canvas */
+.wrap:has(.bboard), .wrap.bwrap {
+  max-width: 1600px !important;
+  width: 95% !important;
+  margin: 0 auto;
+  padding: 16px 20px !important;
+}
 
-/* Column wrapper: modern rounded container */
-.bcol{flex:0 0 260px;min-width:260px;background:#f8fafc;border-radius:12px;padding:8px 6px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
-.bcol-h{font-weight:700;font-size:14px;color:#0f172a;padding:6px 10px;display:flex;align-items:center;gap:8px;text-transform:uppercase;letter-spacing:.05em}
-.bcnt{margin-left:auto;background:#6366f1;color:#fff;border-radius:999px;font-size:12px;font-weight:600;padding:2px 9px;min-width:24px;text-align:center;box-shadow:0 1px 2px rgba(99,102,241,.3)}
+/* Board layout: flexible columns, smooth horizontal scrolling */
+.bboard {
+  display: flex;
+  gap: 14px;
+  overflow-x: auto;
+  padding: 4px 2px 20px;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 transparent;
+}
+.bboard::-webkit-scrollbar { height: 6px; }
+.bboard::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+.bboard::-webkit-scrollbar-track { background: transparent; }
+
+/* Column wrapper: modern rounded container with subtle border */
+.bcol {
+  flex: 0 0 280px;
+  min-width: 280px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 8px 6px;
+  box-shadow: 0 1px 3px rgba(0,0,0,.02);
+  display: flex;
+  flex-direction: column;
+}
+.bcol-h {
+  font-weight: 700;
+  font-size: 12.5px;
+  color: #334155;
+  padding: 6px 10px 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.bcol-h::before {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  background: #94a3b8;
+}
+.bcol[data-col="todo"] .bcol-h::before { background: #64748b; }
+.bcol[data-col="in-progress"] .bcol-h::before { background: #3b82f6; box-shadow: 0 0 0 2px rgba(59,130,246,0.2); }
+.bcol[data-col="blocked"] .bcol-h::before { background: #ef4444; }
+.bcol[data-col="review"] .bcol-h::before { background: #8b5cf6; }
+.bcol[data-col="done"] .bcol-h::before { background: #10b981; }
+
+.bcnt {
+  margin-left: auto;
+  background: #e2e8f0;
+  color: #475569;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 8px;
+  min-width: 22px;
+  text-align: center;
+}
 
 /* Column body: cards container with minimum height */
-.bcol-body{display:flex;flex-direction:column;gap:10px;min-height:40px;padding:2px;transition:background .2s,border-color .2s}
-.bcol-body.drag-over{background:#e0e7ff;border-radius:10px}
+.bcol-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 50px;
+  padding: 2px;
+  transition: background .2s, border-color .2s;
+}
+.bcol-body.drag-over {
+  background: #eef2ff;
+  border: 2px dashed #6366f1;
+  border-radius: 10px;
+}
 
 /* Card: modern elevated style with subtle hover lift */
-.bcard{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;box-shadow:0 2px 4px rgba(0,0,0,.04);transition:transform .15s ease,box-shadow .15s ease,border-color .15s}
-.bcard:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,.08);border-color:#cbd5e1;cursor:grab}
-.bcard.drag{cursor:grab}
-.bcard.dragging{opacity:.5;cursor:grabbing;transform:none;box-shadow:0 2px 4px rgba(0,0,0,.04)}
-.bcard.bcard-static{cursor:pointer}
-.bcard.bcard-static:hover{cursor:pointer}
+.bcard {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 11px 12px;
+  box-shadow: 0 1px 3px rgba(0,0,0,.03);
+  transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease;
+}
+.bcard:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0,0,0,.06);
+  border-color: #cbd5e1;
+  cursor: grab;
+}
+.bcard.drag { cursor: grab; }
+.bcard.dragging {
+  opacity: .4;
+  cursor: grabbing;
+  transform: scale(0.98);
+  box-shadow: 0 2px 6px rgba(0,0,0,.06);
+}
+.bcard.bcard-static { cursor: pointer; }
 
-/* Card elements: ID, title, row */
-.bid{font:600 12px ui-monospace,monospace;color:#6366f1;background:#f0f4ff;border-radius:6px;padding:2px 8px;display:inline-block}
-.btitle{font-size:14px;color:#0f172a;margin:6px 0 8px;line-height:1.45;font-weight:500}
-.brow{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+/* Card elements: ID, title, top row */
+.bcard-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.bid {
+  font: 600 11.5px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #4f46e5;
+  background: #eef2ff;
+  border: 1px solid #e0e7ff;
+  border-radius: 6px;
+  padding: 1px 7px;
+  display: inline-block;
+  letter-spacing: -0.01em;
+}
+.bsprint-tag {
+  font: 500 11px ui-monospace, monospace;
+  color: #64748b;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+.btitle {
+  font-size: 13.5px;
+  color: #0f172a;
+  margin: 6px 0 10px;
+  line-height: 1.45;
+  font-weight: 500;
+}
+.brow {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+  align-items: center;
+}
 
 /* Chips and badges */
-.bchip{font-size:11px;background:#f1f5f9;color:#475569;border-radius:999px;padding:2px 8px;display:inline-flex;align-items:center;gap:4px;border:1px solid #e2e8f0}
-.bchip.bchip-agy{background:#fef2f2;color:#dc2626;border-color:#fecaca}
-.bchip.bchip-kiro{background:#f0fdf4;color:#16a34a;border-color:#bbf7d0}
-.bchip.role-backend{background:#eff6ff;color:#1d4ed8;border-color:#bfdbfe;font-weight:600}
-.bchip.role-frontend{background:#fdf4ff;color:#a21caf;border-color:#f5d0fe;font-weight:600}
-.bchip.role-design{background:#fffbeb;color:#b45309;border-color:#fde68a;font-weight:600}
-.bchip.role-qa{background:#f0fdf4;color:#15803d;border-color:#bbf7d0;font-weight:600}
-.bstage{font-size:10px;border-radius:999px;padding:2px 8px;color:#fff;font-weight:600;text-transform:uppercase}
-.s-stories{background:#8b5cf6}.s-backlog{background:#0ea5e9}.s-prd{background:#f59e0b}
-.s-specs{background:#10b981}.s-tasks{background:#ef4444}.s-reports{background:#6366f1}
-.bstage.bstage-arsip{background:#6b7280;font-size:10px}
+.bchip {
+  font-size: 11px;
+  background: #f1f5f9;
+  color: #475569;
+  border-radius: 999px;
+  padding: 2px 7px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  border: 1px solid #e2e8f0;
+  font-weight: 500;
+}
+.bchip.bchip-agy {
+  background: #fef2f2;
+  color: #b91c1c;
+  border-color: #fecaca;
+  font-weight: 600;
+}
+.bchip.bchip-kiro {
+  background: #f0fdf4;
+  color: #15803d;
+  border-color: #bbf7d0;
+  font-weight: 600;
+}
+.bchip.role-backend {
+  background: #eff6ff;
+  color: #1d4ed8;
+  border-color: #bfdbfe;
+  font-weight: 600;
+}
+.bchip.role-frontend {
+  background: #fdf4ff;
+  color: #a21caf;
+  border-color: #f5d0fe;
+  font-weight: 600;
+}
+.bchip.role-design {
+  background: #fffbeb;
+  color: #b45309;
+  border-color: #fde68a;
+  font-weight: 600;
+}
+.bchip.role-qa {
+  background: #ecfdf5;
+  color: #047857;
+  border-color: #a7f3d0;
+  font-weight: 600;
+}
+.bstage {
+  font-size: 10px;
+  border-radius: 999px;
+  padding: 2px 7px;
+  color: #fff;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .02em;
+}
+.s-stories{background:#8b5cf6}.s-backlog{background:#0284c7}.s-prd{background:#d97706}
+.s-specs{background:#059669}.s-tasks{background:#e11d48}.s-reports{background:#4f46e5}
+.bstage.bstage-arsip{background:#64748b;font-size:10px}
+
+/* Retry button */
+.btn-retry {
+  margin-left: auto;
+  background: #6366f1;
+  color: #ffffff;
+  border: none;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 8px;
+  cursor: pointer;
+  transition: transform .15s ease, background-color .15s ease;
+}
+.btn-retry:hover {
+  background: #4f46e5;
+  transform: translateY(-1px);
+}
 
 /* Empty state */
-.bempty{color:#94a3b8;text-align:center;padding:16px 8px;font-size:13px;font-style:italic}
+.bempty {
+  color: #94a3b8;
+  text-align: center;
+  padding: 24px 8px;
+  font-size: 13px;
+  font-style: italic;
+}
 
-/* Progress sprint cards */
-.sprogwrap{display:flex;flex-direction:column;gap:10px;margin:6px 0 12px}
-.sprog{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:12px;display:block;text-decoration:none;color:inherit;transition:border-color .15s,box-shadow .15s,transform .15s}
-.sprog:hover{border-color:#6366f1;box-shadow:0 4px 12px rgba(99,102,241,.15);transform:translateY(-1px)}
-.sprog.ssel{border-color:#6366f1;box-shadow:0 0 0 2px rgba(99,102,241,.2)}
-.sprog-h{display:flex;justify-content:space-between;align-items:baseline;font-size:14px}
-.sprog-h b{color:#0f172a;font-weight:600}
-.smeta{color:#64748b;font-size:12px;font-weight:500}
-.sbar{height:8px;background:#e2e8f0;border-radius:999px;margin:8px 0 6px;overflow:hidden;position:relative}
-.sbar::after{content:'';position:absolute;inset:0;border-radius:999px;background:linear-gradient(90deg,#6366f1,#8b5cf6);opacity:.15}
-.sfill{height:100%;background:linear-gradient(90deg,#6366f1,#8b5cf6);border-radius:999px;transition:width .35s ease;position:relative}
-.sfill::after{content:'';position:absolute;inset:0;border-radius:999px;background:linear-gradient(90deg,rgba(255,255,255,.2),transparent);opacity:.35}
-.sgoal{color:#334155;font-size:13px;line-height:1.4}
+/* Progress sprint ribbon: horizontal track */
+.sprogwrap {
+  display: flex;
+  flex-direction: row;
+  gap: 12px;
+  overflow-x: auto;
+  padding: 4px 2px 14px;
+  margin: 4px 0 12px;
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 transparent;
+  -webkit-overflow-scrolling: touch;
+}
+.sprogwrap::-webkit-scrollbar { height: 6px; }
+.sprogwrap::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+
+.sprog {
+  flex: 0 0 240px;
+  min-width: 240px;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  text-decoration: none;
+  color: inherit;
+  box-shadow: 0 1px 3px rgba(0,0,0,.03);
+  transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease;
+}
+.sprog:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 16px rgba(0,0,0,.06);
+  border-color: #cbd5e1;
+}
+.sprog.ssel {
+  border-color: #6366f1;
+  background: #fafbff;
+  box-shadow: 0 0 0 2px rgba(99,102,241,.18), 0 4px 12px rgba(99,102,241,.08);
+}
+.sprog-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+.sprog-name {
+  font-weight: 700;
+  font-size: 13.5px;
+  color: #0f172a;
+  letter-spacing: -0.01em;
+}
+.sstat-badge {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 2px 7px;
+  border-radius: 999px;
+  text-transform: uppercase;
+}
+.sstat-done {
+  background: #ecfdf5;
+  color: #047857;
+  border: 1px solid #a7f3d0;
+}
+.sstat-active {
+  background: #eff6ff;
+  color: #1d4ed8;
+  border: 1px solid #bfdbfe;
+  position: relative;
+  padding-left: 14px;
+}
+.sstat-active::before {
+  content: '';
+  position: absolute;
+  left: 5px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #2563eb;
+  animation: sprog-pulse 2s infinite;
+}
+@keyframes sprog-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(37,99,235,0.5); }
+  70% { box-shadow: 0 0 0 5px rgba(37,99,235,0); }
+  100% { box-shadow: 0 0 0 0 rgba(37,99,235,0); }
+}
+.sstat-planning {
+  background: #f1f5f9;
+  color: #475569;
+  border: 1px solid #e2e8f0;
+}
+.sprog-meta {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: #64748b;
+  margin-bottom: 8px;
+  font-weight: 500;
+}
+.sbar {
+  height: 5px;
+  background: #e2e8f0;
+  border-radius: 999px;
+  margin: 2px 0 8px;
+  overflow: hidden;
+}
+.sfill {
+  height: 100%;
+  background: linear-gradient(90deg, #6366f1, #8b5cf6);
+  border-radius: 999px;
+  transition: width .3s ease;
+}
+.sgoal {
+  font-size: 11.5px;
+  color: #475569;
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Toolbar: clean modern controls */
+.treebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 14px;
+  flex-wrap: wrap;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 8px 12px;
+  box-shadow: 0 1px 3px rgba(0,0,0,.02);
+}
+.tb-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.tb-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-left: auto;
+  position: relative;
+}
+.segmented-control {
+  display: inline-flex;
+  background: #f1f5f9;
+  border-radius: 8px;
+  padding: 3px;
+  gap: 2px;
+}
+.segmented-control .btn {
+  padding: 5px 12px;
+  font-size: 12.5px;
+  font-weight: 600;
+  border-radius: 6px;
+  transition: all .15s ease;
+  line-height: 1.4;
+}
+.segmented-control .btn.g {
+  background: #ffffff;
+  color: #0f172a;
+  box-shadow: 0 1px 3px rgba(0,0,0,.08);
+}
+.segmented-control .btn.n {
+  background: transparent;
+  color: #64748b;
+}
+.segmented-control .btn.n:hover {
+  color: #0f172a;
+  background: rgba(255,255,255,.5);
+}
+.filter-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.filter-group select {
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 12.5px;
+  color: #1e293b;
+  font-weight: 500;
+  outline: none;
+  cursor: pointer;
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+.filter-group select:focus {
+  border-color: #6366f1;
+  box-shadow: 0 0 0 2px rgba(99,102,241,.15);
+}
+.item-count-chip {
+  font-size: 11.5px;
+  color: #64748b;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-weight: 600;
+}
+.bridge-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  color: #475569;
+  cursor: default;
+  white-space: nowrap;
+}
+.timer-group {
+  display: inline-flex;
+  align-items: center;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 2px 4px;
+  gap: 4px;
+}
+.timer-group select, .timer-group input {
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  padding: 4px 6px;
+  font-size: 11.5px;
+  color: #1e293b;
+}
+.timer-group input {
+  width: 48px;
+}
+.btn-timer-set {
+  background: #059669;
+  color: #ffffff;
+  border: none;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background .15s ease;
+}
+.btn-timer-set:hover {
+  background: #047857;
+}
+.bell-btn {
+  position: relative;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  transition: background .15s ease, border-color .15s ease;
+}
+.bell-btn:hover {
+  background: #f8fafc;
+  border-color: #cbd5e1;
+}
+.bell-icon {
+  font-size: 16px;
+  line-height: 1;
+}
+#bellBadge {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  background: #ef4444;
+  color: #ffffff;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 0 5px;
+  line-height: 15px;
+  min-width: 15px;
+  text-align: center;
+  box-shadow: 0 1px 2px rgba(0,0,0,.2);
+}
+.bhint {
+  font-size: 12px;
+  color: #64748b;
+  margin: 4px 0 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
 
 /* Notes tab: section header above each group's card row (artifact-library style) */
 .nsec-h{font-weight:700;font-size:13px;color:#475569;text-transform:uppercase;letter-spacing:.05em;margin:18px 0 8px;display:flex;align-items:center;gap:8px;border-bottom:1px solid #e2e8f0;padding-bottom:6px}
@@ -922,14 +1407,12 @@ def _board_card(it, drag=False):
     cur = ' style="cursor:pointer"' if it["stage"] in ("tasks", "reports") else ""
     retry = ""
     if it["stage"] == "tasks" and it.get("status") in ("blocked", "failed") and it.get("assignee") == "agy":
-        retry = (f'<button onclick="retryTask(\'{_html.escape(it["id"])}\',event)" '
-                 f'style="margin-left:auto;background:#7c3aed;color:#fff;border:none;border-radius:6px;transition:transform .15s,box-shadow .15s;'
-                 f'font-size:11px;padding:2px 8px;cursor:pointer"'
-                 f'onmouseover="this.style.transform=\'translateY(-1px)\'" onmouseout="this.style.transform=\'translateY(0)\'">🔄 retry</button>')
+        retry = f'<button class="btn-retry" onclick="retryTask(\'{_html.escape(it["id"])}\',event)">🔄 retry</button>'
+    sprint_tag = f'<span class="bsprint-tag">{_html.escape(it["sprint"])}</span>' if it.get("sprint") and it["sprint"] != "product-backlog" else ""
     return (f'<div class="{cls}"{cur} data-asg="{_html.escape(it["assignee"])}" data-role="{_html.escape(role)}"'
             f' data-sprint="{_html.escape(it["sprint"])}"'
             f' data-id="{_html.escape(it["id"])}" data-stage="{it["stage"]}" data-arch="{"1" if it.get("archived") else ""}"{dattr}{clickable}>'
-            f'<div class="bid">{_html.escape(it["id"])}</div>'
+            f'<div class="bcard-top"><span class="bid">{_html.escape(it["id"])}</span>{sprint_tag}</div>'
             f'<div class="btitle">{_html.escape(it["title"])}</div>'
             f'<div class="brow">{stg}{role_flag}{asg}{arch}{retry}</div></div>')
 
@@ -954,12 +1437,19 @@ def render_board(view="status", sprint_filter="", show_archived=False):
         total = len(ts)
         pct = int(done * 100 / total) if total else 0
         g = sprints[sn]
+        s_status = (g.get("status") or "active").lower()
         sel = " ssel" if sn == sprint_filter else ""
         href = f'/board?view={view}&sprint={quote(sn)}' + ("&archived=1" if show_archived else "")
-        prog.append(f'<a class="sprog{sel}" href="{href}" title="Lihat task sprint ini"><div class="sprog-h"><b>{_html.escape(sn)}</b> '
-                    f'<span class="smeta">{_html.escape(g.get("category") or "")} · {done}/{total} task done</span></div>'
-                    f'<div class="sbar"><div class="sfill" style="width:{pct}%"></div></div>'
-                    f'<div class="sgoal">{_html.escape(g.get("goal") or "")}</div></a>')
+        prog.append(
+            f'<a class="sprog{sel}" href="{href}" title="Lihat task {sn}">'
+            f'<div class="sprog-top">'
+            f'<span class="sprog-name">{_html.escape(sn)}</span>'
+            f'<span class="sstat-badge sstat-{s_status}">{_html.escape(s_status.upper())}</span>'
+            f'</div>'
+            f'<div class="sprog-meta"><span class="scat">{_html.escape(g.get("category") or "Sprint")}</span><span class="stask-count">{done}/{total} done</span></div>'
+            f'<div class="sbar"><div class="sfill" style="width:{pct}%"></div></div>'
+            f'<div class="sgoal">{_html.escape(g.get("goal") or "")}</div></a>'
+        )
     prog_html = f'<div class="sprogwrap">{"".join(prog)}</div>' if prog else ""
 
     # columns depend on view
@@ -1009,30 +1499,46 @@ def render_board(view="status", sprint_filter="", show_archived=False):
     role_opts = '<option value="">Semua peran</option>' + "".join(f'<option value="{_html.escape(r)}">{_html.escape(role_labels.get(r, r.upper()))}</option>' for r in roles)
 
     body = f"""
-<div class="treebar noprint" style="align-items:center">
-  {tog("status","🗂 Status")}{tog("stage","🪜 Alur")}{arch_tog}<a class="btn n" href="/#notes-root">📚 Research</a>
-  <select id="bsprint" onchange="var v=this.value;location.href='/board?view={view}'+(v?'&sprint='+encodeURIComponent(v):'')+'{"&archived=1" if show_archived else ""}'">{sprint_opts}</select>
-  <select id="basg" onchange="applyFilters()">{asg_opts}</select>
-  <select id="brole" onchange="applyFilters()">{role_opts}</select>
-  <span class="smeta">{len(view_items)} item{" · ARSIP" if show_archived else ""}</span>
-  <span id="bridgeHealth" class="smeta" style="margin-left:auto;cursor:default" title="Kesehatan bridge agy">⏳ cek bridge…</span>
-  <span class="smeta" style="display:inline-flex;align-items:center;gap:4px" title="Interval cron bridge">
-    <select id="ivTimer" class="btn n" style="padding:3px 6px" onchange="loadInterval()">{"".join(f'<option value="{u}">{l}</option>' for u,l in TIMERS.items())}</select>
-    <input id="ivVal" type="number" min="1" step="1" value="5" style="width:52px;padding:3px 6px;border:1px solid #cbd5e1;border-radius:6px">
-    <select id="ivUnit" class="btn n" style="padding:3px 6px"><option value="minute">minute</option><option value="hours">hours</option><option value="days">days</option></select>
-    <button class="btn g" style="padding:3px 10px" onclick="setInterval_()">set</button>
-  </span>
-  <span id="bellWrap" class="smeta" style="position:relative;cursor:pointer" onclick="bellClick(event)" title="Notifikasi task selesai">🔔<span id="bellBadge" style="display:none;position:absolute;top:-6px;right:-8px;background:#dc2626;color:#fff;border-radius:9px;font-size:10px;padding:0 5px;line-height:15px">0</span></span>
-  <div id="bellPanel" style="display:none;position:absolute;right:16px;top:52px;width:340px;max-height:420px;overflow:auto;background:#111827;color:#e5e7eb;border:1px solid #374151;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.4);z-index:9999">
-    <div style="padding:10px 12px;border-bottom:1px solid #374151;font-weight:600;display:flex;justify-content:space-between;align-items:center">Task selesai (H+7)<span id="bellClear" style="font-size:11px;color:#9ca3af;cursor:pointer">bersihkan badge</span></div>
-    <div id="bellList" style="padding:4px"></div>
+<div class="treebar noprint">
+  <div class="tb-left">
+    <div class="segmented-control">
+      {tog("status","🗂 Status")}{tog("stage","🪜 Alur")}{arch_tog}<a class="btn n" href="/#notes-root">📚 Research</a>
+    </div>
+    <div class="filter-group">
+      <select id="bsprint" onchange="var v=this.value;location.href='/board?view={view}'+(v?'&sprint='+encodeURIComponent(v):'')+'{"&archived=1" if show_archived else ""}'">{sprint_opts}</select>
+      <select id="basg" onchange="applyFilters()">{asg_opts}</select>
+      <select id="brole" onchange="applyFilters()">{role_opts}</select>
+      <span class="item-count-chip">{len(view_items)} item{" · ARSIP" if show_archived else ""}</span>
+    </div>
+  </div>
+  <div class="tb-right">
+    <span id="bridgeHealth" class="bridge-pill" title="Kesehatan bridge agy">⏳ cek bridge…</span>
+    <span class="timer-group" title="Interval cron bridge">
+      <select id="ivTimer" onchange="loadInterval()">{"".join(f'<option value="{u}">{l}</option>' for u,l in TIMERS.items())}</select>
+      <input id="ivVal" type="number" min="1" step="1" value="5">
+      <select id="ivUnit"><option value="minute">min</option><option value="hours">hr</option><option value="days">d</option></select>
+      <button class="btn-timer-set" onclick="setInterval_()">Set</button>
+    </span>
+    <span id="bellWrap" class="bell-btn" onclick="bellClick(event)" title="Notifikasi task selesai">
+      <span class="bell-icon">🔔</span>
+      <span id="bellBadge" style="display:none">0</span>
+    </span>
+    <div id="bellPanel" style="display:none;position:absolute;right:0;top:calc(100% + 8px);width:360px;max-height:420px;overflow:auto;background:#1e293b;color:#f1f5f9;border:1px solid #334155;border-radius:12px;box-shadow:0 12px 36px rgba(0,0,0,.25);z-index:9999">
+      <div style="padding:12px 14px;border-bottom:1px solid #334155;font-weight:600;font-size:13px;display:flex;justify-content:space-between;align-items:center">
+        <span>Task selesai (H+7)</span>
+        <span id="bellClear" style="font-size:11px;color:#94a3af;cursor:pointer;padding:2px 6px;border-radius:4px;background:#334155">bersihkan badge</span>
+      </div>
+      <div id="bellList" style="padding:4px"></div>
+    </div>
   </div>
 </div>
 {prog_html}
-<div class="bhint noprint" style="color:#6b7280;font-size:12px;margin:-4px 0 8px">{"💡 Seret kartu Task antar-kolom untuk ubah status (tersimpan ke board + sync artifact)." if is_status else "🪜 Mode Alur: kolom = tahap produk (read-only). Beralih ke Status untuk drag-ubah status."}</div>
+<div class="bhint noprint">{"💡 Seret kartu Task antar-kolom untuk ubah status (tersimpan ke board + sync artifact)." if is_status else "🪜 Mode Alur: kolom = tahap produk (read-only). Beralih ke Status untuk drag-ubah status."}</div>
 <div class="bboard">{"".join(col_html)}</div>
 <div class="toast" id="toast"></div>
 <script>
+var _w = document.querySelector('.wrap');
+if (_w) _w.classList.add('bwrap');
 function applyFilters(){{
   var a = (document.getElementById('basg')||{{}}).value || '';
   var r = (document.getElementById('brole')||{{}}).value || '';

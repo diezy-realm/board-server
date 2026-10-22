@@ -1518,7 +1518,7 @@ def _board_card(it, drag=False):
             f'<div class="btitle">{_html.escape(it["title"])}</div>'
             f'<div class="brow">{stg}{role_flag}{asg}{arch}{retry}</div></div>')
 
-def render_board(view="status", sprint_filter="", show_archived=False):
+def render_board(view="status", sprint_filter=None, show_archived=False):
     items, sprints = load_board()
     # split active vs archived; default board shows active only
     if show_archived:
@@ -1544,16 +1544,36 @@ def render_board(view="status", sprint_filter="", show_archived=False):
                 continue
 
         active_scope_sprints.append(sn)
+
+    active_sprint = next((sn for sn in active_scope_sprints if (sprints.get(sn, {}).get("status") or "").lower() == "active"), "")
+
+    # Default landing: jika sprint_filter tidak dispesifikasikan (dibuka dari index / navbar tanpa ?sprint=),
+    # DEFAULT HARUS menampilkan sprint active dan task pada sprint active.
+    if sprint_filter is None:
+        if not show_archived and active_sprint:
+            sprint_filter = active_sprint
+        elif show_archived and active_scope_sprints:
+            sprint_filter = active_scope_sprints[-1]
+        else:
+            sprint_filter = ""
+    elif sprint_filter.lower() in ("all", "*", "semua"):
+        sprint_filter = ""
+    elif sprint_filter and sprint_filter not in active_scope_sprints:
+        sprint_filter = active_sprint if not show_archived else ""
+
+    for sn in active_scope_sprints:
+        g = sprints[sn]
+        s_status = (g.get("status") or "active").lower()
         # Hitung task dari scope_items untuk SEMUA sprint di baris ini
         ts = [it for it in scope_items if it["sprint"] == sn and it["stage"] == "tasks"]
         done = sum(1 for it in ts if it["status"] == "done")
         total = len(ts)
         pct = int(done * 100 / total) if total else 0
         sel = " ssel" if sn == sprint_filter else ""
-        # Toggle: jika diklik saat sudah terpilih, hapus filter (unselect)
-        next_sprint = "" if sn == sprint_filter else sn
-        href = f'/board?view={view}' + (f'&sprint={quote(next_sprint)}' if next_sprint else '') + ('&archived=1' if show_archived else '')
-        title = f'Batalkan filter {sn}' if sn == sprint_filter else f'Filter task {sn}'
+        # Toggle: jika diklik saat sudah terpilih, alihkan ke 'all' (lihat semua sprint)
+        next_sprint = "all" if sn == sprint_filter else sn
+        href = f'/board?view={view}&sprint={quote(next_sprint)}' + ('&archived=1' if show_archived else '')
+        title = f'Batalkan filter {sn} (lihat semua sprint)' if sn == sprint_filter else f'Filter task {sn}'
         sel_badge = '<span class="ssel-indicator">Dipilih ✓</span>' if sn == sprint_filter else ""
         fill_done_cls = " sfill-done" if (total > 0 and done == total) else ""
 
@@ -1570,8 +1590,6 @@ def render_board(view="status", sprint_filter="", show_archived=False):
     prog_html = f'<div class="sprogwrap">{"".join(prog)}</div>' if prog else ""
 
     # Filter items untuk kartu kolom Kanban / Stage
-    if sprint_filter and sprint_filter not in active_scope_sprints:
-        sprint_filter = ""
     filtered_items = scope_items
     if sprint_filter:
         filtered_items = [it for it in filtered_items if it["sprint"] == sprint_filter]
@@ -1610,11 +1628,12 @@ def render_board(view="status", sprint_filter="", show_archived=False):
             f'<div class="bcol-body"{drop}>{"".join(_board_card(it, drag=is_status) for it in cards) or "<div class=bempty>—</div>"}</div></div>')
 
     all_sprints = active_scope_sprints
-    sprint_opts = '<option value="">Semua sprint</option>' + "".join(
+    sprint_opts = f'<option value="all"{" selected" if not sprint_filter else ""}>Semua sprint</option>' + "".join(
         f'<option value="{_html.escape(s)}"{" selected" if s==sprint_filter else ""}>{_html.escape(s)}</option>'
         for s in all_sprints)
+    sprint_param_str = f"&sprint={quote(sprint_filter)}" if sprint_filter else "&sprint=all"
     tog = lambda v, lbl: (f'<a class="btn {"g" if v==view else "n"}" '
-                          f'href="/board?view={v}{"&sprint="+quote(sprint_filter) if sprint_filter else ""}{"&archived=1" if show_archived else ""}">{lbl}</a>')
+                          f'href="/board?view={v}{sprint_param_str}{"&archived=1" if show_archived else ""}">{lbl}</a>')
     arch_tog = (f'<a class="btn {"g" if show_archived else "n"}" '
                 f'href="/board?view={view}{"&archived=1" if not show_archived else ""}">{"📦 Arsip" if not show_archived else "📦 Arsip ✓"}</a>')
     asgs = sorted({it["assignee"] for it in filtered_items if it["assignee"]})
@@ -2223,9 +2242,10 @@ class H(BaseHTTPRequestHandler):
         if path == "/board":
             qs = parse_qs(self.path.split("?",1)[1]) if "?" in self.path else {}
             view = (qs.get("view") or ["status"])[0]
-            sprint = (qs.get("sprint") or [""])[0]
+            sprint_param = qs.get("sprint")
             archived = (qs.get("archived") or [""])[0] in ("1", "true", "yes")
-            return self._send(render_board("stage" if view=="stage" else "status", sprint, archived))
+            sprint_val = sprint_param[0] if sprint_param is not None else None
+            return self._send(render_board("stage" if view=="stage" else "status", sprint_val, archived))
         if path == "/api/note":
             qs = parse_qs(self.path.split("?",1)[1]) if "?" in self.path else {}
             ok, r = op_note_get((qs.get("id") or [""])[0])

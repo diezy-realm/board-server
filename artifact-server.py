@@ -1092,14 +1092,19 @@ BOARD_EXTRA_CSS = """
   text-transform: uppercase;
 }
 .sstat-done {
-  background: #064e3b;
+  background: rgba(16, 185, 129, 0.15);
   color: #34d399;
-  border: 1px solid #059669;
+  border: 1px solid rgba(16, 185, 129, 0.4);
+}
+.sstat-closed {
+  background: rgba(100, 116, 139, 0.15);
+  color: #94a3b8;
+  border: 1px solid rgba(100, 116, 139, 0.3);
 }
 .sstat-active {
-  background: #1e1b4b;
-  color: #c084fc;
-  border: 1px solid #7c3aed;
+  background: rgba(168, 85, 247, 0.18);
+  color: #d8b4fe;
+  border: 1px solid rgba(168, 85, 247, 0.45);
   position: relative;
   padding-left: 14px;
 }
@@ -1122,9 +1127,19 @@ BOARD_EXTRA_CSS = """
   100% { box-shadow: 0 0 0 0 rgba(192,132,252,0); }
 }
 .sstat-planning {
-  background: #18192c;
-  color: #94a3b8;
-  border: 1px solid #282a44;
+  background: rgba(56, 189, 248, 0.12);
+  color: #38bdf8;
+  border: 1px solid rgba(56, 189, 248, 0.35);
+}
+.ssel-indicator {
+  font-size: 9.5px;
+  font-weight: 600;
+  color: #c084fc;
+  background: rgba(168, 85, 247, 0.2);
+  padding: 1px 6px;
+  border-radius: 4px;
+  margin-left: 6px;
+  vertical-align: middle;
 }
 .sprog-meta {
   display: flex;
@@ -1148,6 +1163,10 @@ BOARD_EXTRA_CSS = """
   border-radius: 999px;
   box-shadow: 0 0 8px rgba(168,85,247,0.5);
   transition: width .3s ease;
+}
+.sfill.sfill-done {
+  background: linear-gradient(90deg, #059669, #10b981);
+  box-shadow: 0 0 8px rgba(16, 185, 129, 0.5);
 }
 .sgoal {
   font-size: 11.5px;
@@ -1366,6 +1385,23 @@ def load_board():
     items, sprints = [], {}
     if not BOARD_DIR.is_dir():
         return items, sprints
+
+    # sprint goals/status (active sprints + archived sprints)
+    sprint_dirs = list((BOARD_DIR / "sprints").glob("sprint-*")) if (BOARD_DIR / "sprints").is_dir() else []
+    sprint_dirs += list((BOARD_DIR / "archive").glob("sprint-*")) if (BOARD_DIR / "archive").is_dir() else []
+    for sd in sorted(sprint_dirs):
+        sp = sd / "SPRINT.md"
+        g = {"goal": "", "category": "", "status": "active"}
+        if sp.is_file():
+            fm = _board_fm(sp.read_text(encoding="utf-8", errors="replace"))
+            g.update({k: fm.get(k, g[k]) for k in g})
+        s_status = (g.get("status") or "active").lower()
+        is_done_or_closed = s_status in ("done", "closed")
+        # Otomatis arsip jika folder di archive/ ATAU status sprint done/closed
+        g["archived"] = (sd.parent.name == "archive") or is_done_or_closed
+        g["status"] = s_status
+        sprints[sd.name] = g
+
     # Valid artifact ID prefix per stage (mirrors validate.py STAGES) -- skips
     # stray files like README.md that live inside a stage folder but aren't artifacts.
     _ID_PREFIX = {"stories": "US", "backlog": "BL", "prd": "PRD",
@@ -1395,32 +1431,26 @@ def load_board():
             meta = _board_fm(text)
         # locate sprint (sprints/sprint-NN/...) vs product-backlog vs archive
         parts = f.relative_to(BOARD_DIR).parts
-        archived = parts[0] == "archive"
+        archived_by_path = (parts[0] == "archive")
         if parts and parts[0] == "sprints" and len(parts) > 1:
             sprint = parts[1]
-        elif archived:
+        elif archived_by_path:
             sprint = next((p for p in parts if p.startswith("sprint-")), "archive")
         else:
             sprint = "product-backlog"
         status_raw = (meta.get("status") or "todo").lower()
+        
+        # Sprint status inheritance: jika sprint-nya sudah done/closed atau di archive, item otomatis archived
+        sp_meta = sprints.get(sprint)
+        is_item_archived = archived_by_path or bool(sp_meta and sp_meta.get("archived"))
+        
         items.append({
             "id": meta.get("id") or f.stem, "title": meta.get("title") or f.stem,
             "stage": stage, "status": status_raw, "assignee": meta.get("assignee") or "",
             "role": (meta.get("role") or "").lower(),
             "tags": meta.get("tags") if isinstance(meta.get("tags"), list) else [],
-            "sprint": sprint, "rel": f.relative_to(BOARD_DIR).as_posix(), "archived": archived,
+            "sprint": sprint, "rel": f.relative_to(BOARD_DIR).as_posix(), "archived": is_item_archived,
         })
-    # sprint goals/status (active sprints + archived sprints)
-    sprint_dirs = list((BOARD_DIR / "sprints").glob("sprint-*")) if (BOARD_DIR / "sprints").is_dir() else []
-    sprint_dirs += list((BOARD_DIR / "archive").glob("sprint-*")) if (BOARD_DIR / "archive").is_dir() else []
-    for sd in sorted(sprint_dirs):
-        sp = sd / "SPRINT.md"
-        g = {"goal": "", "category": "", "status": "active"}
-        if sp.is_file():
-            fm = _board_fm(sp.read_text(encoding="utf-8", errors="replace"))
-            g.update({k: fm.get(k, g[k]) for k in g})
-        g["archived"] = (sd.parent.name == "archive")
-        sprints[sd.name] = g
     return items, sprints
 
 def _board_card(it, drag=False):
@@ -1458,37 +1488,59 @@ def render_board(view="status", sprint_filter="", show_archived=False):
     items, sprints = load_board()
     # split active vs archived; default board shows active only
     if show_archived:
-        items = [it for it in items if it.get("archived")]
+        scope_items = [it for it in items if it.get("archived")]
     else:
-        items = [it for it in items if not it.get("archived")]
-    # sprint filter dropdown
-    all_sprints = sorted({it["sprint"] for it in items})
-    if sprint_filter:
-        items = [it for it in items if it["sprint"] == sprint_filter]
+        scope_items = [it for it in items if not it.get("archived")]
+
     # progress per sprint (match archived scope)
+    # Aturan penting:
+    # 1. Top bar status utama HANYA untuk status active dan planning (sprint done/closed otomatis ke arsip).
+    # 2. Seluruh sprint card WAJIB counting task dari scope_items (bukan hanya sprint yang di-select!).
     prog = []
+    active_scope_sprints = []
     for sn in sorted(sprints.keys()):
-        if bool(sprints[sn].get("archived")) != bool(show_archived):
-            continue
-        ts = [it for it in items if it["sprint"] == sn and it["stage"] == "tasks"]
+        g = sprints[sn]
+        s_status = (g.get("status") or "active").lower()
+        is_archived = bool(g.get("archived"))
+        if show_archived:
+            if not is_archived:
+                continue
+        else:
+            if is_archived or s_status not in ("active", "planning"):
+                continue
+
+        active_scope_sprints.append(sn)
+        # Hitung task dari scope_items untuk SEMUA sprint di baris ini
+        ts = [it for it in scope_items if it["sprint"] == sn and it["stage"] == "tasks"]
         done = sum(1 for it in ts if it["status"] == "done")
         total = len(ts)
         pct = int(done * 100 / total) if total else 0
-        g = sprints[sn]
-        s_status = (g.get("status") or "active").lower()
         sel = " ssel" if sn == sprint_filter else ""
-        href = f'/board?view={view}&sprint={quote(sn)}' + ("&archived=1" if show_archived else "")
+        # Toggle: jika diklik saat sudah terpilih, hapus filter (unselect)
+        next_sprint = "" if sn == sprint_filter else sn
+        href = f'/board?view={view}' + (f'&sprint={quote(next_sprint)}' if next_sprint else '') + ('&archived=1' if show_archived else '')
+        title = f'Batalkan filter {sn}' if sn == sprint_filter else f'Filter task {sn}'
+        sel_badge = '<span class="ssel-indicator">Dipilih ✓</span>' if sn == sprint_filter else ""
+        fill_done_cls = " sfill-done" if (total > 0 and done == total) else ""
+
         prog.append(
-            f'<a class="sprog{sel}" href="{href}" title="Lihat task {sn}">'
+            f'<a class="sprog{sel}" href="{href}" title="{title}">'
             f'<div class="sprog-top">'
-            f'<span class="sprog-name">{_html.escape(sn)}</span>'
+            f'<span class="sprog-name">{_html.escape(sn)}{sel_badge}</span>'
             f'<span class="sstat-badge sstat-{s_status}">{_html.escape(s_status.upper())}</span>'
             f'</div>'
             f'<div class="sprog-meta"><span class="scat">{_html.escape(g.get("category") or "Sprint")}</span><span class="stask-count">{done}/{total} done</span></div>'
-            f'<div class="sbar"><div class="sfill" style="width:{pct}%"></div></div>'
+            f'<div class="sbar"><div class="sfill{fill_done_cls}" style="width:{pct}%"></div></div>'
             f'<div class="sgoal">{_html.escape(g.get("goal") or "")}</div></a>'
         )
     prog_html = f'<div class="sprogwrap">{"".join(prog)}</div>' if prog else ""
+
+    # Filter items untuk kartu kolom Kanban / Stage
+    if sprint_filter and sprint_filter not in active_scope_sprints:
+        sprint_filter = ""
+    filtered_items = scope_items
+    if sprint_filter:
+        filtered_items = [it for it in filtered_items if it["sprint"] == sprint_filter]
 
     # columns depend on view
     if view == "stage":
@@ -1508,7 +1560,7 @@ def render_board(view="status", sprint_filter="", show_archived=False):
     # Status view = Kanban status, konsep yang hanya berlaku untuk task (unit eksekusi agy);
     # story/backlog/spec/report adalah artefak perencanaan/laporan, sudah punya kolom sendiri
     # di view Alur -- disembunyikan di sini agar kolom status tidak tercampur type lain.
-    view_items = [it for it in items if it["stage"] == "tasks"] if is_status else items
+    view_items = [it for it in filtered_items if it["stage"] == "tasks"] if is_status else filtered_items
     colmap = {c: [] for c in cols}
     for it in view_items:
         b = bucket(it)
@@ -1523,6 +1575,7 @@ def render_board(view="status", sprint_filter="", show_archived=False):
             f'<div class="bcol" data-col="{c}"><div class="bcol-h">{col_label(c)}<span class="bcnt">{len(cards)}</span></div>'
             f'<div class="bcol-body"{drop}>{"".join(_board_card(it, drag=is_status) for it in cards) or "<div class=bempty>—</div>"}</div></div>')
 
+    all_sprints = active_scope_sprints
     sprint_opts = '<option value="">Semua sprint</option>' + "".join(
         f'<option value="{_html.escape(s)}"{" selected" if s==sprint_filter else ""}>{_html.escape(s)}</option>'
         for s in all_sprints)
@@ -1530,9 +1583,9 @@ def render_board(view="status", sprint_filter="", show_archived=False):
                           f'href="/board?view={v}{"&sprint="+quote(sprint_filter) if sprint_filter else ""}{"&archived=1" if show_archived else ""}">{lbl}</a>')
     arch_tog = (f'<a class="btn {"g" if show_archived else "n"}" '
                 f'href="/board?view={view}{"&archived=1" if not show_archived else ""}">{"📦 Arsip" if not show_archived else "📦 Arsip ✓"}</a>')
-    asgs = sorted({it["assignee"] for it in items if it["assignee"]})
+    asgs = sorted({it["assignee"] for it in filtered_items if it["assignee"]})
     asg_opts = '<option value="">Semua assignee</option>' + "".join(f'<option value="{_html.escape(a)}">{_html.escape(a)}</option>' for a in asgs)
-    roles = [r for r in ["backend", "frontend", "design", "qa"] if any(it.get("role")==r for it in items)]
+    roles = [r for r in ["backend", "frontend", "design", "qa"] if any(it.get("role")==r for it in filtered_items)]
     role_labels = {"backend": "🛠 Backend", "frontend": "🎨 Frontend", "design": "✨ Design", "qa": "🧪 QA"}
     role_opts = '<option value="">Semua peran</option>' + "".join(f'<option value="{_html.escape(r)}">{_html.escape(role_labels.get(r, r.upper()))}</option>' for r in roles)
 
